@@ -18,10 +18,11 @@ if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$PYTHON_VERSION" | sort -V | head -n1
     exit 1
 fi
 
-# Check if requirements are installed
-if ! python3 -c "import psutil" &> /dev/null; then
-    echo "Installing dependencies..."
-    pip install -r requirements.txt
+# Check if Tkinter is available
+if ! python3 -c "import tkinter" &> /dev/null; then
+    echo "Error: Tkinter is not installed"
+    echo "Please install python3-tk for your system"
+    exit 1
 fi
 
 # Run the GUI

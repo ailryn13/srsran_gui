@@ -1,0 +1,26 @@
+# Example Configuration for srsRAN GUI
+# This file shows an example of how the configuration is structured
+# The actual configuration is stored in JSON format at:
+# ~/.srsran_gui/config.json
+
+# Working Directory
+# The directory where srsRAN components will run
+working_dir = /home/user/srsran
+
+# EPC (Evolved Packet Core) Configuration
+epc_binary = /usr/local/bin/srsepc
+epc_config = /etc/srsran/epc.conf
+
+# eNB (Evolved Node B / Base Station) Configuration  
+enb_binary = /usr/local/bin/srsenb
+enb_config = /etc/srsran/enb.conf
+
+# UE (User Equipment) Configuration
+ue_binary = /usr/local/bin/srsue
+ue_config = /etc/srsran/ue.conf
+
+# Notes:
+# 1. Binary paths can be absolute or just the command name if in PATH
+# 2. Config files are optional - leave empty to use default configs
+# 3. Working directory should be writable by the user running the GUI
+# 4. All paths will be validated when you click "Save Configuration"

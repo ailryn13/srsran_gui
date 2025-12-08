@@ -295,7 +295,8 @@ License:
 This GUI is provided as-is for use with srsRAN.
 
 For more information about srsRAN, visit:
-https://www.srslte.com/
+https://www.srsran.com/
+https://docs.srsran.com/
 
 For issues and contributions to this GUI, please visit the project repository.
         """

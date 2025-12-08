@@ -42,7 +42,7 @@ srsRAN GUI provides an intuitive graphical interface for managing srsRAN compone
    ```
 
 2. **srsRAN installed on your system**
-   - Visit [srsRAN website](https://www.srslte.com/) for installation instructions
+   - Visit [srsRAN website](https://www.srsran.com/) for installation instructions
    - Ensure `srsepc`, `srsenb`, and `srsue` binaries are accessible
 
 3. **Required Python packages**
@@ -235,7 +235,7 @@ This project is open source and available for use with srsRAN.
 
 ## Acknowledgments
 
-- [srsRAN](https://www.srslte.com/) - The underlying 4G/5G software radio suite
+- [srsRAN](https://www.srsran.com/) - The underlying 4G/5G software radio suite
 - Python Tkinter - GUI framework
 
 ## Support
