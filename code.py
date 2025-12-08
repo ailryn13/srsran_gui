@@ -46,6 +46,7 @@ class SrsRanGuiApp(Gtk.Window):
 
         self.core_running = False
         self.core_button_ref = None
+        self.core_terminal_ref = None
 
         # Determine desktop path for captures
         sudo_user = os.environ.get('SUDO_USER')
@@ -65,6 +66,7 @@ class SrsRanGuiApp(Gtk.Window):
         self.core_monitor_scheduler_id = None 
         self.gnb_config_scheduler_id = None
         self.ue_config_scheduler_id = None
+        self.core_scheduler_id = None
         
         self.webview_container = None
         self.original_content_pane = None
@@ -150,7 +152,7 @@ class SrsRanGuiApp(Gtk.Window):
         if not row or row.get_index() == self.current_menu_index:
             return
         
-        protected_keys=["gnb", "ue", "tshark"]
+        protected_keys = ["gnb", "ue", "tshark", "core"]
         for key in list(self.terminals.keys()):
             if key not in protected_keys:
                 if key == "tshark" and self.tshark_running:
@@ -374,34 +376,80 @@ class SrsRanGuiApp(Gtk.Window):
 
     def toggle_core_process(self, _):
         if not self.core_running:
-            # Placeholder start command
-            print("Starting 5G Core (Placeholder Command)...")
-            # Example: subprocess.run(["sudo", "docker-compose", "-f", "~/open5gs/docker-compose.yaml", "up", "-d"])
-            
-            self.core_running = True
+            terminal = self.create_terminal_tab("core", "5G Core Console")
+            terminal.connect("child-exited", self.on_process_exited, "core")
+            self.core_terminal_ref = terminal
             
             ctx = self.core_button_ref.get_style_context()
             ctx.remove_class("start-button")
             ctx.add_class("stop-button")
             self.core_button_ref.set_label(f"{STOP_SYMBOL} Stop 5G Core")
+
+            def startup_complete():
+                self.core_running = True
+
+            # Placeholder sequential commands
+            # User can update this list with actual commands like:
+            # "cd ~/open5gs", "docker-compose up -d", etc.
+            commands = [
+                "echo 'Starting 5G Core Sequence...'",
+                "sleep 1",
+                "echo 'Running Step 1 (Placeholder)...'",
+                "sleep 1", 
+                "echo '5G Core Started (Placeholder)'"
+            ]
+            
+            self._send_commands_sequentially(
+                terminal,
+                commands,
+                "core_scheduler_id",
+                delay=1000,
+                on_complete=startup_complete
+            )
         else:
-            # Placeholder stop command
-            print("Stopping 5G Core (Placeholder Command)...")
-            # Example: subprocess.run(["sudo", "docker-compose", "down"])
+            if self.core_scheduler_id:
+                GLib.source_remove(self.core_scheduler_id)
+                self.core_scheduler_id = None
             
-            self.core_running = False
+            if self.core_terminal_ref:
+                self.core_terminal_ref.feed_child(b'\x03') # Ctrl+C
+                # Optional: Send specific stop command if Ctrl+C isn't enough
+                # self.core_terminal_ref.feed_child(b'docker-compose down\n')
             
-            ctx = self.core_button_ref.get_style_context()
-            ctx.remove_class("stop-button")
-            ctx.add_class("start-button")
-            self.core_button_ref.set_label(f"{PLAY_SYMBOL} Start 5G Core")
+            self.reset_core_button()
+
+    def reset_core_button(self):
+        self.core_running = False
+        def update_ui():
+            if self.core_button_ref:
+                ctx = self.core_button_ref.get_style_context()
+                ctx.remove_class("stop-button")
+                ctx.add_class("start-button")
+                self.core_button_ref.set_label(f"{PLAY_SYMBOL} Start 5G Core")
+        GLib.idle_add(update_ui)
 
     # -------------------------------------------------------------------------
     # PROCESS LOGIC
     # -------------------------------------------------------------------------
 
+    def _show_alert(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK,
+            text="Startup Order Error",
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
     def toggle_gnb_process(self, _):
         if not self.gnb_running:
+            if not self.core_running:
+                self._show_alert("Please start the 5G Core Network first.")
+                return
+
             terminal = self.create_terminal_tab("gnb", "gNB Console")
             terminal.connect("child-exited", self.on_process_exited, "gnb")
             self.gnb_terminal_ref = terminal
@@ -417,7 +465,11 @@ class SrsRanGuiApp(Gtk.Window):
 
             # srsRAN 5G typically uses a config file (gnb.yaml or gnb.conf)
             # Adjust path as needed: ~/srsRAN_Project/build/gnb
-            commands = ["cd ~/srsRAN_Project/build", "sudo ./gnb -c gnb.yaml"]
+            commands = [
+                "echo 'Starting gNB...'",
+                "cd ~/srsRAN_Project/build",
+                "sudo ./gnb -c gnb.yaml"
+            ]
             self._send_commands_sequentially(
                 terminal,
                 commands,
@@ -451,17 +503,10 @@ class SrsRanGuiApp(Gtk.Window):
     def toggle_ue_process(self, _):
         if not self.ue_running:
             if not self.gnb_running:
-                dialog = Gtk.MessageDialog(
-                    transient_for=self,
-                    flags=0,
-                    message_type=Gtk.MessageType.WARNING,
-                    buttons=Gtk.ButtonsType.OK,
-                    text="gNB is not running",
-                )
-                dialog.format_secondary_text("Please start the gNB process first.")
-                dialog.run()
-                dialog.destroy()
+                self._show_alert("Please start the gNB first.")
                 return
+
+
 
             terminal = self.create_terminal_tab("ue", "UE Console")
             terminal.connect("child-exited", self.on_process_exited, "ue")
@@ -477,7 +522,11 @@ class SrsRanGuiApp(Gtk.Window):
                 self.fetch_and_display_ue_ips()
 
             # srsRAN 5G UE command
-            commands = ["cd ~/srsRAN_Project/build", "sudo ./ue -c ue.yaml"]
+            commands = [
+                "echo 'Starting UE...'",
+                "cd ~/srsRAN_Project/build",
+                "sudo ./ue -c ue.yaml"
+            ]
             self._send_commands_sequentially(
                 terminal,
                 commands,
@@ -646,6 +695,8 @@ class SrsRanGuiApp(Gtk.Window):
             self.reset_ue_button()
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
+        elif key == "core" and self.core_running:
+            self.reset_core_button()
 
     def _check_process_status(self):
         # Watchdog to reset buttons if process crashes
@@ -941,7 +992,7 @@ class SrsRanGuiApp(Gtk.Window):
                 elif key == "tshark" and self.tshark_running: self.toggle_tshark_process(None)
                 page = self.terminal_notebook.page_num(frame)
                 if page != -1: self.terminal_notebook.remove_page(page)
-                if key not in ("gnb", "ue", "tshark"): self.terminals.pop(key, None)
+                if key not in ("gnb", "ue", "tshark", "core"): self.terminals.pop(key, None)
 
             btn_close.connect("clicked", close_tab)
             vbox.pack_start(header, False, False, 0)
