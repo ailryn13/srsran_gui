@@ -1,0 +1,5 @@
+# Core dependencies
+# Tkinter comes with Python standard library
+
+# Additional utilities
+psutil>=5.9.0
