@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-import gi, os, signal, subprocess, threading, re, time
-os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'
+import os, signal, subprocess, threading, re, time, sys
+os.environ['GDK_BACKEND'] = 'x11'                  # Force X11 (fixes Wayland crashes)
+os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'          # Force software rendering
+os.environ['WEBKIT_DISABLE_DMABUF_RENDERER'] = '1' # Disable DMABuf (common crash source)
+os.environ['WEBKIT_DISABLE_COMPOSITING_MODE'] = '1' # Optional: Reduce GPU load
 
 # --- FIX: Handling WebKit Version Compatibility ---
+import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Vte", "2.91")
 try:
@@ -29,11 +33,16 @@ class SrsRanGuiApp(Gtk.Window):
         self.set_default_size(1100, 750)
         self.setup_css()
         self.terminals = {}
+        self.closing_terminals = []
+        self.is_closing = False
 
         # Runtime control state
         self.gnb_running = False
         self.gnb_terminal_ref = None
         self.gnb_button_ref = None
+
+        self.grafana_terminal_ref = None
+        self.grafana_scheduler_id = None
         
         self.ue_running = False
         self.ue_terminal_ref = None
@@ -122,7 +131,7 @@ class SrsRanGuiApp(Gtk.Window):
         self.paned.set_position(280)
         self.listbox.select_row(self.listbox.get_row_at_index(0))
         
-        GLib.timeout_add_seconds(2, self._check_process_status)
+        self.process_watchdog_id = GLib.timeout_add_seconds(2, self._check_process_status)
         self.show_all()
         
     def on_content_paned_allocated(self, widget, allocation):
@@ -174,6 +183,7 @@ class SrsRanGuiApp(Gtk.Window):
             self.content_paned.set_position(self.default_terminal_pane_position)
         else:
             def hide_terminal_pane():
+                if self.is_closing: return False
                 allocation = self.content_paned.get_allocation()
                 if allocation.height > 0:
                     self.content_paned.set_position(allocation.height)
@@ -374,8 +384,10 @@ class SrsRanGuiApp(Gtk.Window):
         webui_btn.connect("clicked", self.on_core_webui)
         parent_box.pack_start(webui_btn, False, False, 5)
 
-    def toggle_core_process(self, _):
+    def toggle_core_process(self, widget, force=False):
         if not self.core_running:
+            # --- STARTUP LOGIC (Unchanged) ---
+            self.core_button_ref.set_sensitive(False)
             terminal = self.create_terminal_tab("core", "5G Core Console")
             terminal.connect("child-exited", self.on_process_exited, "core")
             self.core_terminal_ref = terminal
@@ -387,16 +399,13 @@ class SrsRanGuiApp(Gtk.Window):
 
             def startup_complete():
                 self.core_running = True
+                self.core_button_ref.set_sensitive(True)
 
-            # Placeholder sequential commands
-            # User can update this list with actual commands like:
-            # "cd ~/open5gs", "docker-compose up -d", etc.
             commands = [
-                "echo 'Starting 5G Core Sequence...'",
-                "sleep 1",
-                "echo 'Running Step 1 (Placeholder)...'",
-                "sleep 1", 
-                "echo '5G Core Started (Placeholder)'"
+                "sudo su",
+                "cd",
+                "cd srsRAN_Project/docker",
+                "sudo docker compose up 5gc"
             ]
             
             self._send_commands_sequentially(
@@ -407,21 +416,41 @@ class SrsRanGuiApp(Gtk.Window):
                 on_complete=startup_complete
             )
         else:
+            # --- STOPPING LOGIC ---
+            
+            # 1. SAFETY CHECK (Only if not forced)
+            # If the user clicks the button, we warn them.
+            if not force and (self.gnb_running or self.ue_running):
+                self._show_alert("Cannot stop 5G Core while gNB or UE are active.\nPlease stop User Equipment and gNB first.")
+                return
+
+            # 2. Proceed with Stop
+            if "core" in self.terminals:
+                # Switch to tab to show logs
+                frame = self.terminals["core"]['frame']
+                page = self.terminal_notebook.page_num(frame)
+                if page != -1:
+                    self.terminal_notebook.set_current_page(page)
+                    current_pos = self.content_paned.get_position()
+                    max_pos = self.content_paned.get_allocation().height
+                    if current_pos > max_pos - 100: 
+                        self.content_paned.set_position(self.default_terminal_pane_position)
+
             if self.core_scheduler_id:
                 GLib.source_remove(self.core_scheduler_id)
                 self.core_scheduler_id = None
             
             if self.core_terminal_ref:
                 self.core_terminal_ref.feed_child(b'\x03') # Ctrl+C
-                # Optional: Send specific stop command if Ctrl+C isn't enough
-                # self.core_terminal_ref.feed_child(b'docker-compose down\n')
             
             self.reset_core_button()
 
     def reset_core_button(self):
         self.core_running = False
         def update_ui():
-            if self.core_button_ref:
+            if self.is_closing: return
+            if self.core_button_ref and self.core_button_ref.get_realized():
+                self.core_button_ref.set_sensitive(True)
                 ctx = self.core_button_ref.get_style_context()
                 ctx.remove_class("stop-button")
                 ctx.add_class("start-button")
@@ -444,15 +473,39 @@ class SrsRanGuiApp(Gtk.Window):
         dialog.run()
         dialog.destroy()
 
-    def toggle_gnb_process(self, _):
+    def toggle_gnb_process(self, widget, force=False):
         if not self.gnb_running:
+            # --- STARTUP SEQUENCE (Grafana First -> Then gNB) ---
+            
+            # 1. Prerequisite Check
             if not self.core_running:
                 self._show_alert("Please start the 5G Core Network first.")
                 return
 
-            terminal = self.create_terminal_tab("gnb", "gNB Console")
-            terminal.connect("child-exited", self.on_process_exited, "gnb")
-            self.gnb_terminal_ref = terminal
+            self.gnb_button_ref.set_sensitive(False)
+
+            # 2. Start Grafana (Background Tab)
+            # We open a tab for it so you can verify it started.
+            grafana_terminal = self.create_terminal_tab("grafana", "Grafana Service")
+            self.grafana_terminal_ref = grafana_terminal
+            
+            # --- GRAFANA START COMMAND ---
+            # You can change this command if you use Docker or a specific script.
+            grafana_cmd = [
+                "echo 'Starting Grafana Service...'",
+                "sudo systemctl start grafana-server",
+                "echo 'Grafana started.'"
+            ]
+            self._send_commands_sequentially(grafana_terminal, grafana_cmd, "grafana_scheduler_id")
+            
+            # 3. Wait a moment to ensure Grafana is ready
+            # This prevents gNB from trying to push metrics before Grafana/InfluxDB is listening.
+            time.sleep(2)
+
+            # 4. Start gNB (Foreground Tab)
+            gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
+            # Connect the gNB process exit to the cleanup handler
+            self.gnb_terminal_ref = gnb_terminal
             
             ctx = self.gnb_button_ref.get_style_context()
             ctx.remove_class("start-button")
@@ -461,24 +514,27 @@ class SrsRanGuiApp(Gtk.Window):
 
             def startup_complete():
                 self.gnb_running = True
+                self.gnb_button_ref.set_sensitive(True)
                 self.fetch_and_display_gnb_ips()
 
-            # srsRAN 5G typically uses a config file (gnb.yaml or gnb.conf)
-            # Adjust path as needed: ~/srsRAN_Project/build/gnb
             commands = [
-                "echo 'Starting gNB...'",
-                "cd ~/srsRAN_Project/build",
-                "sudo ./gnb -c gnb.yaml"
+                "sudo su",
+                "cd",
+                "cd ~/srsRAN_Project/build/app/gnb",
+                "sudo gnb -c  /home/student/Downloads/gnb_zmq.yaml"
             ]
             self._send_commands_sequentially(
-                terminal,
+                gnb_terminal,
                 commands,
                 "gnb_command_scheduler_id",
                 delay=1000,
                 on_complete=startup_complete
             )
         else:
-            if self.ue_running:
+            # --- STOPPING SEQUENCE (gNB First -> Then Grafana) ---
+            
+            # 1. Safety Check (UE must be stopped first)
+            if not force and self.ue_running:
                 dialog = Gtk.MessageDialog(
                     transient_for=self,
                     flags=0,
@@ -493,21 +549,40 @@ class SrsRanGuiApp(Gtk.Window):
                 dialog.destroy()
                 return 
             
+            # 2. Stop gNB (Step 1)
             if self.gnb_command_scheduler_id:
                 GLib.source_remove(self.gnb_command_scheduler_id)
                 self.gnb_command_scheduler_id = None
             if self.gnb_terminal_ref:
-                self.gnb_terminal_ref.feed_child(b'\x03') # Ctrl+C
+                self.gnb_terminal_ref.feed_child(b'\x03') # Send Ctrl+C to gNB
+            
+            # 3. Stop Grafana (Step 2)
+            # We send the stop command to the Grafana terminal
+            if self.grafana_terminal_ref:
+                stop_cmd = "sudo systemctl stop grafana-server\n"
+                try:
+                    self.grafana_terminal_ref.feed_child(stop_cmd.encode())
+                except:
+                    pass
+                # We don't close the tab immediately so you can see the output, 
+                # but we clear the reference so the app knows it's "off".
+                self.grafana_terminal_ref = None
+
             self.reset_gnb_button()
 
     def toggle_ue_process(self, _):
         if not self.ue_running:
+            # Check Core First
+            if not self.core_running:
+                self._show_alert("Please start the 5G Core Network first.")
+                return
+            
+            # Check gNB Second
             if not self.gnb_running:
                 self._show_alert("Please start the gNB first.")
                 return
 
-
-
+            self.ue_button_ref.set_sensitive(False)
             terminal = self.create_terminal_tab("ue", "UE Console")
             terminal.connect("child-exited", self.on_process_exited, "ue")
             self.ue_terminal_ref = terminal
@@ -519,13 +594,17 @@ class SrsRanGuiApp(Gtk.Window):
 
             def startup_complete():
                 self.ue_running = True
+                self.ue_button_ref.set_sensitive(True)
                 self.fetch_and_display_ue_ips()
 
             # srsRAN 5G UE command
             commands = [
-                "echo 'Starting UE...'",
-                "cd ~/srsRAN_Project/build",
-                "sudo ./ue -c ue.yaml"
+                "sudo su",
+                "cd",
+                "sudo ip netns list",
+                "sudo ip netns add ue1",
+                "cd /srsRAN_4G/build/srsue/src",
+                "sudo srsue /home/student/Downloads/ue_zmq.conf"
             ]
             self._send_commands_sequentially(
                 terminal,
@@ -548,6 +627,7 @@ class SrsRanGuiApp(Gtk.Window):
             os.makedirs(self.capture_folder_path)
 
         if not self.tshark_running:
+            self.tshark_button_ref.set_sensitive(False)
             terminal = self.create_terminal_tab("tshark", "Tshark Capture")
             terminal.connect("child-exited", self.on_process_exited, "tshark")
             self.tshark_terminal_ref = terminal
@@ -559,6 +639,7 @@ class SrsRanGuiApp(Gtk.Window):
             
             def startup_complete():
                 self.tshark_running = True
+                self.tshark_button_ref.set_sensitive(True)
 
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             filename = f"srs_capture_{timestamp}.pcap"
@@ -612,6 +693,7 @@ class SrsRanGuiApp(Gtk.Window):
                 pass
 
             def update_gui():
+                if self.is_closing: return
                 self.gnb_link_ip = link_ip
                 if hasattr(self, 'gnb_ip_label'):
                     self.gnb_ip_label.set_text(f"Link IP: {self.gnb_link_ip}")
@@ -622,6 +704,7 @@ class SrsRanGuiApp(Gtk.Window):
     def reset_gnb_ip_display(self):
         self.gnb_link_ip = "<N/A>"
         def update_gui():
+            if self.is_closing: return
             if hasattr(self, 'gnb_ip_label'):
                 self.gnb_ip_label.set_text("Link IP: <N/A>")
         GLib.idle_add(update_gui)
@@ -642,6 +725,7 @@ class SrsRanGuiApp(Gtk.Window):
                 pass
 
             def update_gui():
+                if self.is_closing: return
                 self.ue_ip = ue_ip
                 # Removed gNB Search IP fetching as requested
                 if hasattr(self, 'ue_ip_label'):
@@ -652,6 +736,7 @@ class SrsRanGuiApp(Gtk.Window):
 
     def reset_ue_ip_display(self):
         def update_gui():
+            if self.is_closing: return
             if hasattr(self, 'ue_ip_label'):
                 self.ue_ip_label.set_text("UE IP: <N/A>")
         GLib.idle_add(update_gui)
@@ -660,7 +745,9 @@ class SrsRanGuiApp(Gtk.Window):
         self.gnb_running = False
         self.reset_gnb_ip_display()
         def update_ui():
-            if self.gnb_button_ref:
+            if self.is_closing: return
+            if self.gnb_button_ref and self.gnb_button_ref.get_realized():
+                self.gnb_button_ref.set_sensitive(True)
                 ctx = self.gnb_button_ref.get_style_context()
                 ctx.remove_class("stop-button")
                 ctx.add_class("start-button")
@@ -671,7 +758,9 @@ class SrsRanGuiApp(Gtk.Window):
         self.ue_running = False
         self.reset_ue_ip_display()
         def update_ui():
-            if self.ue_button_ref:
+            if self.is_closing: return
+            if self.ue_button_ref and self.ue_button_ref.get_realized():
+                self.ue_button_ref.set_sensitive(True)
                 ctx = self.ue_button_ref.get_style_context()
                 ctx.remove_class("stop-button")
                 ctx.add_class("start-button")
@@ -681,7 +770,9 @@ class SrsRanGuiApp(Gtk.Window):
     def reset_tshark_button(self):
         self.tshark_running = False
         def update_ui():
-            if self.tshark_button_ref:
+            if self.is_closing: return
+            if self.tshark_button_ref and self.tshark_button_ref.get_realized():
+                self.tshark_button_ref.set_sensitive(True)
                 ctx = self.tshark_button_ref.get_style_context()
                 ctx.remove_class("stop-button")
                 ctx.add_class("start-button")
@@ -689,29 +780,57 @@ class SrsRanGuiApp(Gtk.Window):
         GLib.idle_add(update_ui)
 
     def on_process_exited(self, _terminal, _exit_status, key):
+        if key not in self.terminals:
+            return
+
         if key == "gnb" and self.gnb_running:
             self.reset_gnb_button()
         elif key == "ue" and self.ue_running:
             self.reset_ue_button()
+        elif key == "core" and self.core_running:
+            # Core died (shell exited). 
+            # Use the shared handler to ensure UE/gNB are stopped too.
+            self.handle_core_stopped_unexpectedly()
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
-        elif key == "core" and self.core_running:
-            self.reset_core_button()
-
+        
     def _check_process_status(self):
-        # Watchdog to reset buttons if process crashes
+        if self.is_closing:
+            return False
+            
+        # Watchdog to reset buttons if process crashes or is stopped via Ctrl+C
         processes = {
-            'gnb': (self.gnb_running, self.handle_gnb_stopped_unexpectedly, "./gnb"),
-            'ue': (self.ue_running, self.reset_ue_button, "./ue"),
-            'tshark': (self.tshark_running, self.reset_tshark_button, "tshark")
+            'gnb': (self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c"),
+            'ue': (self.ue_running, self.reset_ue_button, "srsue"),
+            'tshark': (self.tshark_running, self.reset_tshark_button, "tshark"),
+            # --- FIX: Use the new handler that triggers cascade shutdown ---
+            'core': (self.core_running, self.handle_core_stopped_unexpectedly, "docker compose up")
         }
+        
         for key, (running, func, ptrn) in processes.items():
             if running:
                 try:
+                    # pgrep checks if the specific command is running in the background
                     subprocess.run(['pgrep', '-f', ptrn], check=True, stdout=subprocess.DEVNULL)
                 except:
+                    # If not found, run the cleanup function
                     GLib.idle_add(func)
         return True
+
+    def handle_core_stopped_unexpectedly(self):
+        # This function is called by the Watchdog when it sees 
+        # "docker compose" is no longer running (e.g., after Ctrl+C)
+        
+        # 1. Stop UE if running
+        if self.ue_running:
+            self.toggle_ue_process(None)
+            
+        # 2. Stop gNB if running (Force=True to skip checks)
+        if self.gnb_running:
+            self.toggle_gnb_process(None, force=True)
+            
+        # 3. Finally reset the Core button
+        self.reset_core_button()
 
     def handle_gnb_stopped_unexpectedly(self):
         self.reset_gnb_button()
@@ -726,45 +845,189 @@ class SrsRanGuiApp(Gtk.Window):
             ("Docker", self.on_core_docker_menu),
             ("Config", self.on_core_config),
             ("Logs", self.on_core_logs),
-            ("Web UI", self.on_core_webui)
+            ("Web UI", self.on_core_webui),
+            ("Speedtest", self.on_core_speedtest),
         ]
         self.add_toolbar_with_content(items, "core_area", "core_buttons")
 
     def on_core_docker_menu(self, _):
-        """
-        Fetches 'docker ps' output and displays it in a read-only tab.
-        """
-        # Switch to terminal view
-        self.content_paned.set_position(self.default_terminal_pane_position)
+        # 1. Clear the 'core_area' (the content box below the main buttons)
+        # This acts as our "Submenu" view
+        box = self.core_area
+        for c in box.get_children(): box.remove(c)
+
+        # 2. Create the Layout for the Submenu
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        vbox.set_margin_top(20)
+        vbox.set_margin_start(20)
         
-        # Clear previous content in the core area
+        # Title
+        title = Gtk.Label(label="Docker Management Tools")
+        title.get_style_context().add_class("header-title")
+        vbox.pack_start(title, False, False, 0)
+
+        # 3. Create a Grid for the Buttons (2x2 Layout)
+        grid = Gtk.Grid()
+        grid.set_column_spacing(20)
+        grid.set_row_spacing(20)
+        grid.set_halign(Gtk.Align.CENTER)
+
+        # Define the menu options
+        options = [
+            ("Docker Containers", self.on_docker_containers, "View running and stopped containers"),
+            ("Docker Images", self.on_docker_images, "List all locally available images"),
+            ("Docker Networks", self.on_docker_networks, "Inspect network bridges and IP ranges"),
+            ("Docker Stats", self.on_docker_stats, "Live CPU/Memory usage of containers")
+        ]
+
+        # 4. Generate Buttons
+        for i, (label_text, handler, tooltip) in enumerate(options):
+            btn = Gtk.Button(label=label_text)
+            btn.set_size_request(200, 60)
+            btn.set_tooltip_text(tooltip)
+            btn.get_style_context().add_class("big-menu-label") # Reuse existing style
+            btn.connect("clicked", handler)
+            
+            # Calculate grid position (2 columns)
+            col = i % 2
+            row = i // 2
+            grid.attach(btn, col, row, 1, 1)
+
+        vbox.pack_start(grid, False, False, 0)
+        
+        # Add a help tip at the bottom
+        tip = Gtk.Label(label="Click a button above to open the corresponding terminal view.")
+        tip.set_opacity(0.7)
+        vbox.pack_start(tip, False, False, 10)
+
+        box.pack_start(vbox, True, True, 0)
+        box.show_all()
+
+    # --- Docker Submenu Handlers ---
+
+    def on_docker_containers(self, _):
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        terminal = self.create_terminal_tab("docker_ps", "Docker Containers")
+        # We use 'watch' so it updates live every 2 seconds
+        command = "sudo docker ps\n"
+        self._run_simple_command(terminal, command)
+
+    def on_docker_images(self, _):
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        terminal = self.create_terminal_tab("docker_img", "Docker Images")
+        command = "sudo docker images\n"
+        self._run_simple_command(terminal, command)
+
+    def on_docker_networks(self, _):
+        # 1. Clear the content area
         box = self.core_area
         for child in box.get_children():
             box.remove(child)
 
-        # Create the tab using the existing helper
-        text_buffer = self.create_textview_tab("docker_view", "Docker Status")
-        text_buffer.set_text("Fetching Docker status...")
+        # 2. Fetch network names
+        networks = []
+        error_message = None
+        try:
+            cmd = ["sudo", "docker", "network", "ls", "--format", "{{.Name}}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            output = result.stdout.strip()
+            if output:
+                networks = sorted(output.split('\n'))
+        except subprocess.CalledProcessError:
+            error_message = "Error: Could not list Docker networks.\nIs the Docker daemon running?"
 
-        def worker():
-            # Run docker ps with a clean table format
-            cmd = 'docker ps -a --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"'
-            try:
-                # Try running as current user
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                
-                # If that fails (permission denied), try sudo
-                if res.returncode != 0 or "permission denied" in res.stderr.lower():
-                    cmd = 'sudo ' + cmd
-                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                
-                output = res.stdout if res.stdout else "No Docker containers found or Docker is not running."
-            except Exception as e:
-                output = f"Error fetching Docker stats: {str(e)}"
+        # 3. Create the UI Layout
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        
+        # --- HEADER SECTION (Back Button + Title) ---
+        hbox_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        
+        # Back Button
+        btn_back = Gtk.Button(label="Back")
+        # When clicked, reload the Docker menu (the 2x2 grid)
+        btn_back.connect("clicked", self.on_core_docker_menu)
+        hbox_header.pack_start(btn_back, False, False, 0)
+        
+        # Title
+        lbl = Gtk.Label(label="Docker Networks")
+        lbl.get_style_context().add_class("header-title")
+        hbox_header.pack_start(lbl, False, False, 0)
+        
+        vbox.pack_start(hbox_header, False, False, 0)
+        # ---------------------------------------------
+
+        # Handle errors or empty lists
+        if error_message:
+            lbl_err = Gtk.Label(label=error_message)
+            vbox.pack_start(lbl_err, False, False, 0)
+        elif not networks:
+            lbl_empty = Gtk.Label(label="No networks found.")
+            vbox.pack_start(lbl_empty, False, False, 0)
+        else:
+            # Create a scrolling list of buttons
+            listbox = Gtk.ListBox()
+            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
             
-            GLib.idle_add(text_buffer.set_text, output)
+            for net_name in networks:
+                row = Gtk.ListBoxRow()
+                
+                # Create the button for the network
+                btn = Gtk.Button(label=net_name)
+                btn.set_alignment(0.0, 0.5) # Align text to the left
+                btn.set_relief(Gtk.ReliefStyle.NONE) # Flat look
+                
+                # Connect the click event to our inspect handler
+                btn.connect("clicked", self.on_network_inspect_clicked, net_name)
+                
+                row.add(btn)
+                listbox.add(row)
+                
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.add(listbox)
+            vbox.pack_start(scrolled, True, True, 0)
 
-        threading.Thread(target=worker, daemon=True).start()
+        box.pack_start(vbox, True, True, 0)
+        box.show_all()
+        
+        # 4. Ensure we are viewing the list
+        allocation = self.content_paned.get_allocation()
+        self.content_paned.set_position(allocation.height)
+
+    def on_network_inspect_clicked(self, button, network_name):
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Create a new tab for this inspection
+        terminal = self.create_terminal_tab(f"net_{network_name}", f"Net: {network_name}")
+        
+        # 3. commands to run
+        commands = [
+            f"echo '--- Inspecting Network: {network_name} ---'",
+            f"sudo docker network inspect {network_name}"
+        ]
+        
+        # 4. Execute
+        # reusing core_logs_scheduler_id is fine here as it's a one-off command sequence
+        self._send_commands_sequentially(terminal, commands, "core_logs_scheduler_id")
+
+    def on_docker_stats(self, _):
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        terminal = self.create_terminal_tab("docker_stats", "Docker Stats")
+        # standard docker stats is interactive and perfect for this
+        command = "sudo docker stats\n"
+        self._run_simple_command(terminal, command)
+
+    def _run_simple_command(self, terminal, command):
+        # Helper to send a single command safely
+        def send():
+            if not self.is_closing and terminal:
+                try:
+                    terminal.feed_child(command.encode())
+                except:
+                    pass
+            return False
+        GLib.timeout_add(500, send)
 
     def show_gnb_menu(self):
         items = [
@@ -779,64 +1042,78 @@ class SrsRanGuiApp(Gtk.Window):
         items = [
             ("Config", self.on_ue_config),
             ("Logs", self.on_ue_logs),
-            ("Web UI", self.on_ue_webui),
             ("Pcap", self.on_ue_pcap),
+            ("Speedtest", self.on_ue_speedtest),
         ]
         self.add_toolbar_with_content(items, "ue_area", "ue_buttons")
 
     def on_gnb_logs(self, _):
-        # List .log files in build directory
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        
-        log_dir = os.path.expanduser("~/srsRAN_Project/build")
-        if os.path.exists(log_dir):
-            files = sorted([f for f in os.listdir(log_dir) if f.endswith('.log')])
-        else: files = []
-        
-        box = self.gnb_area
-        for c in box.get_children(): box.remove(c)
-        
-        listbox = Gtk.ListBox()
-        if not files:
-            row = Gtk.ListBoxRow()
-            row.add(Gtk.Label(label="No logs found in ~/srsRAN_Project/build"))
-            listbox.add(row)
-        else:
-            for f in files:
-                row = Gtk.ListBoxRow()
-                btn = Gtk.Button(label=f, xalign=0)
-                # Use a specific handler for gNB logs if needed, reusing core log viewer for now
-                # assuming we want to view them. on_log_file_clicked uses /var/log/open5gs...
-                # Need a new handler or make on_log_file_clicked generic.
-                # Let's make a generic viewer.
-                btn.connect("clicked", self.on_gnb_log_file_clicked, log_dir, f)
-                row.add(btn)
-                listbox.add(row)
-                
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.add(listbox)
-        box.pack_start(scrolled, True, True, 15)
-        box.show_all()
-
-    def on_gnb_log_file_clicked(self, button, log_dir, filename):
+        # 1. Switch to terminal view
         self.content_paned.set_position(self.default_terminal_pane_position)
-        terminal = self.create_terminal_tab(f"gnblog-{filename}", "Log: " + filename)
-        command = f'cat {os.path.join(log_dir, filename)}\n'
-        GLib.timeout_add(300, lambda: terminal.feed_child(command.encode()) or False)
+        
+        # 2. Clear previous buttons
+        box = self.gnb_area
+        for child in box.get_children():
+            box.remove(child)
+            
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("gnb_logs", "gNB Logs")
+        
+        # 4. Define the command sequence
+        # We assume the log is in the build directory. 
+        # If your log is elsewhere (e.g. /var/log), change the path here.
+        commands = [
+            "sudo su",
+            "cd",    # 1. Go to build folder
+            "cd /tmp",                # 2. Verify file exists
+            "cat gnb.log"                   # 3. Display content
+        ]
+        
+        # 5. Execute
+        self._send_commands_sequentially(terminal, commands, "gnb_logs_scheduler_id")
 
     def on_gnb_webui(self, _):
-        self.on_gnb_webview(_)
-
-    def on_ue_logs(self, _):
-        # Placeholder for UE Logs
         allocation = self.content_paned.get_allocation()
         self.content_paned.set_position(allocation.height)
+        if self.webview_container: return
+        self.original_content_pane = self.content_box
+        self.webview_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        back_btn = Gtk.Button(label="Back")
+        back_btn.connect("clicked", lambda w: self._restore_main_view())
+        header.pack_start(back_btn, False, False, 10)
+        webview = WebKit2.WebView()
+        webview.load_uri("http://127.0.0.1:3300/")
+        self.webview_container.pack_start(header, False, False, 0)
+        self.webview_container.pack_start(webview, True, True, 0)
+        self.content_paned.remove(self.original_content_pane)
+        self.content_paned.pack1(self.webview_container, resize=True, shrink=False)
+        self.webview_container.show_all()
+
+    def on_ue_logs(self, _):
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Clear previous buttons
         box = self.ue_area
-        for c in box.get_children(): box.remove(c)
-        lbl = Gtk.Label(label="UE Logs functionality coming soon")
-        box.pack_start(lbl, True, True, 0)
-        box.show_all()
+        for child in box.get_children():
+            box.remove(child)
+            
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("ue_logs", "UE Logs")
+        
+        # 4. Define the command sequence
+        # We assume the log is in the build directory. 
+        # If your log is elsewhere (e.g. /var/log), change the path here.
+        commands = [
+            "sudo su",
+            "cd",    
+            "cd /tmp",                
+            "cat ue.log"                    
+        ]
+        
+        # 5. Execute
+        self._send_commands_sequentially(terminal, commands, "ue_logs_scheduler_id")
 
     def on_ue_webui(self, _):
         # Placeholder for UE Web UI
@@ -871,6 +1148,48 @@ class SrsRanGuiApp(Gtk.Window):
         lbl = Gtk.Label(label="Pcap functionality coming soon")
         box.pack_start(lbl, True, True, 0)
         box.show_all()
+    def on_ue_speedtest(self, _):
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Clear previous content
+        box = self.ue_area
+        for child in box.get_children():
+            box.remove(child)
+
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("ue_speedtest", "UE 5G Speedtest")
+        
+        # 4. Define Command Logic
+        # We combine this into a single block to ensure variables (like IP) persist.
+        # It finds the UE IP, then uses 'nr-binder' to force traffic through that IP.
+        
+        bash_script = (
+            "echo '--- Checking Prerequisites ---'; "
+            "if ! command -v speedtest-cli &> /dev/null; then "
+            "   echo 'Tool speedtest-cli not found. Installing now...'; "
+            "   sudo apt-get update && sudo apt-get install -y speedtest-cli; "
+            "fi; "
+            
+            "echo '--- Locating UE Interface (uesimtun0) ---'; "
+            # Extract IP address of uesimtun0
+            "UE_IP=$(ip -4 addr show uesimtun0 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'); "
+            
+            "if [ -z \"$UE_IP\" ]; then "
+            "   echo 'Error: Could not find IP for uesimtun0.'; "
+            "   echo 'Is the UE running? Please Start UE first.'; "
+            "else "
+            "   echo \"UE IP Found: $UE_IP\"; "
+            "   echo '--- Running Speedtest via 5G Tunnel ---'; "
+            "   cd ~/UERANSIM/build; "
+            # Use nr-binder to bind the speedtest to the UE's IP
+            "   sudo ./nr-binder $UE_IP speedtest-cli --simple; "
+            "fi"
+        )
+        
+        # 5. Execute
+        # Pass as a single list item so it runs as one script block
+        self._send_commands_sequentially(terminal, [bash_script], "ue_speedtest_scheduler_id")
 
     def on_gnb_pcap(self, _):
         # Placeholder for Pcap
@@ -889,44 +1208,69 @@ class SrsRanGuiApp(Gtk.Window):
         for c in box.get_children(): box.remove(c)
         terminal = self.create_terminal_tab("ue_bin", "UE Binaries")
         command = "ls -l ~/srsRAN_Project/build/ue\n"
-        GLib.timeout_add(300, lambda: terminal.feed_child(command.encode()) or False)
+        GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
 
     def on_gnb_config(self, _):
-        self._show_config_view(self.gnb_area, "gnb", "srsRAN_Project/build", "gnb.yaml", "gnb_config_scheduler_id")
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Clear previous content
+        box = self.gnb_area
+        for child in box.get_children():
+            box.remove(child)
+
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("gnb_config", "gNB Config")
+
+        # 4. Define the 3 commands to run one by one
+        commands = [
+            "sudo su",      # Command 1: Go to the folder
+            "cd",              # Command 2: Show file details/size
+            "cat gnb_zmq.yaml"                 # Command 3: Display content
+        ]
+        
+        # 5. Execute them sequentially
+        # We use a unique scheduler ID for this task
+        self._send_commands_sequentially(terminal, commands, "gnb_config_scheduler_id")
         
     def on_ue_config(self, _):
-        self._show_config_view(self.ue_area, "ue", "srsRAN_Project/build", "ue.yaml", "ue_config_scheduler_id")
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Clear previous content
+        box = self.ue_area
+        for child in box.get_children():
+            box.remove(child)
+
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("ue_config", "UE Config")
+
+        # 4. Define the 3 commands to run one by one
+        # Based on your toggle_ue_process, the file is ue_zmq.conf
+        commands = [
+            "sudo su",      # Command 1: Go to the folder
+            "cd",               # Command 2: Verify file exists
+            "cat ue_zmq.conf"                  # Command 3: Display content
+        ]
+        
+        # 5. Execute them sequentially
+        self._send_commands_sequentially(terminal, commands, "ue_config_scheduler_id")
+        
 
     def on_core_config(self, _):
-        # Open5GS config logic
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        config_dir = "/etc/open5gs"
-        if os.path.exists(config_dir):
-            files = sorted([f for f in os.listdir(config_dir) if f.endswith('.yaml')])
-        else: files = []
-        
-        box = self.core_area
-        for c in box.get_children(): box.remove(c)
-        
-        listbox = Gtk.ListBox()
-        for f in files:
-            row = Gtk.ListBoxRow()
-            btn = Gtk.Button(label=f, xalign=0)
-            btn.connect("clicked", self.on_core_config_file_clicked, f)
-            row.add(btn)
-            listbox.add(row)
-            
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.add(listbox)
-        box.pack_start(scrolled, True, True, 15)
-        box.show_all()
+        # Start browsing at /open5gs/src inside the container
+        # The third argument ensures the "Back" button stops here.
+        self._browse_docker_container(
+            container_name="open5gs_5gc", 
+            current_path="/open5gs/src", 
+            root_path="/open5gs/src"
+        )
 
     def on_core_config_file_clicked(self, button, filename):
         self.content_paned.set_position(self.default_terminal_pane_position)
         terminal = self.create_terminal_tab(f"conf-{filename}", "Conf: " + filename)
         command = f'cat /etc/open5gs/{filename}\n'
-        GLib.timeout_add(300, lambda: terminal.feed_child(command.encode()) or False)
+        GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
 
     def _show_config_view(self, area_box, key_prefix, config_path, config_file, scheduler_id_attr):
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -937,82 +1281,163 @@ class SrsRanGuiApp(Gtk.Window):
         self._send_commands_sequentially(terminal, commands, scheduler_id_attr)
 
     def on_core_logs(self, _):
-        # Open5GS logs logic
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        log_dir = "/var/log/open5gs"
-        if os.path.exists(log_dir):
-            files = sorted([f for f in os.listdir(log_dir) if f.endswith('.log')])
-        else: files = []
-        box = self.core_area
-        for c in box.get_children(): box.remove(c)
-        listbox = Gtk.ListBox()
-        for f in files:
-            row = Gtk.ListBoxRow()
-            btn = Gtk.Button(label=f, xalign=0)
-            btn.connect("clicked", self.on_log_file_clicked, f)
-            row.add(btn)
-            listbox.add(row)
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.add(listbox)
-        box.pack_start(scrolled, True, True, 15)
-        box.show_all()
-
-    def on_log_file_clicked(self, button, filename):
+        # 1. Switch to terminal view
         self.content_paned.set_position(self.default_terminal_pane_position)
-        terminal = self.create_terminal_tab(f"log-{filename}", "Log: " + filename)
-        command = f'cat /var/log/open5gs/{filename}\n'
-        GLib.timeout_add(300, lambda: terminal.feed_child(command.encode()) or False)
+        
+        # 2. Clear previous content (like the file buttons)
+        box = self.core_area
+        for child in box.get_children():
+            box.remove(child)
+            
+        # 3. Create the log tab
+        terminal = self.create_terminal_tab("core_logs", "5G Core Logs")
+        
+        # 4. Commands with 'less' pager
+        # - 2>&1: Captures both standard output and error messages
+        # - less -R: Opens the reader in "Raw" mode to preserve colors
+        # - +G: (Optional) Auto-scroll to the very bottom (most recent logs)
+        commands = [
+            "cd",
+            "cd srsRAN_Project/docker",
+            "sudo docker compose ps",
+            "sudo docker logs open5gs_5gc 2>&1 | less -R +G" 
+        ]
+        
+        # 5. Execute
+        self._send_commands_sequentially(terminal, commands, "core_logs_scheduler_id")
+    
+    def on_core_speedtest(self, _):
+        # 1. Switch to terminal view
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Clear previous content
+        box = self.core_area
+        for child in box.get_children():
+            box.remove(child)
+
+        # 3. Create the tab
+        terminal = self.create_terminal_tab("core_speedtest", "Network Speedtest")
+        
+        # 4. Define Commands
+        # This script checks if 'speedtest-cli' is installed. 
+        # If not, it installs it automatically before running the test.
+        commands = [
+            "echo '--- Checking Internet Connectivity ---'",
+            "if ! command -v speedtest-cli &> /dev/null; then",
+            "    echo 'Tool `speedtest-cli` not found. Installing now...'",
+            "    sudo apt-get update && sudo apt-get install -y speedtest-cli",
+            "fi",
+            "echo '--------------------------------------'",
+            "echo 'Running Speedtest... Please wait...'",
+            "echo '--------------------------------------'",
+            "speedtest-cli --simple"
+        ]
+        
+        # 5. Execute
+        # We use a unique scheduler ID so it doesn't conflict with other timers
+        self._send_commands_sequentially(terminal, commands, "core_speedtest_scheduler_id")
 
     # -------------------------------------------------------------------------
     # UTILS & HELPERS
     # -------------------------------------------------------------------------
     def create_terminal_tab(self, key, title):
+        # 1. Check if terminal exists
         if key in self.terminals:
             terminal_info = self.terminals[key]
+            frame = terminal_info['frame']
             terminal = terminal_info['terminal']
-            terminal.spawn_async(Vte.PtyFlags.DEFAULT, os.environ['HOME'], ["/bin/bash"], [], GLib.SpawnFlags.DEFAULT, None, None, -1, None, None)
-            page_num = self.terminal_notebook.page_num(terminal_info['frame'])
-            if page_num != -1: self.terminal_notebook.set_current_page(page_num)
-        else:
-            frame = Gtk.Frame()
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-            lbl = Gtk.Label(label=title)
-            btn_close = Gtk.Button(label="✖")
-            header.pack_start(lbl, True, True, 5)
-            header.pack_start(btn_close, False, False, 0)
-            terminal = Vte.Terminal()
-            terminal.set_scrollback_lines(1000)
-            terminal.spawn_async(Vte.PtyFlags.DEFAULT, os.environ['HOME'], ["/bin/bash"], [], GLib.SpawnFlags.DEFAULT, None, None, -1, None, None)
             
-            def close_tab(_):
-                if key == "gnb" and self.gnb_running: self.toggle_gnb_process(None)
-                elif key == "ue" and self.ue_running: self.toggle_ue_process(None)
-                elif key == "tshark" and self.tshark_running: self.toggle_tshark_process(None)
-                page = self.terminal_notebook.page_num(frame)
-                if page != -1: self.terminal_notebook.remove_page(page)
-                if key not in ("gnb", "ue", "tshark", "core"): self.terminals.pop(key, None)
+            page_num = self.terminal_notebook.page_num(frame)
+            if page_num != -1:
+                self.terminal_notebook.set_current_page(page_num)
+                return terminal
+            else:
+                self.terminals.pop(key, None)
 
-            btn_close.connect("clicked", close_tab)
-            vbox.pack_start(header, False, False, 0)
-            
-            scrolled = Gtk.ScrolledWindow()
-            scrolled.add(terminal)
-            vbox.pack_start(scrolled, True, True, 0)
-            frame.add(vbox)
+        # 2. Create UI Elements
+        frame = Gtk.Frame()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        lbl = Gtk.Label(label=title)
+        btn_close = Gtk.Button(label="✖")
+        header.pack_start(lbl, True, True, 5)
+        header.pack_start(btn_close, False, False, 0)
+        
+        terminal = Vte.Terminal()
+        terminal.set_scrollback_lines(1000)
+        terminal.spawn_async(Vte.PtyFlags.DEFAULT, os.environ['HOME'], ["/bin/bash"], [], GLib.SpawnFlags.DEFAULT, None, None, -1, None, None)
+        
+        # --- RESTORED LISTENER: This makes Ctrl+C work ---
+        terminal.connect("child-exited", self.on_process_exited, key)
+        # -------------------------------------------------
 
-            # Tab Label Click Event
-            tab_label = Gtk.Label(label=title)
-            event_box = Gtk.EventBox()
-            event_box.add(tab_label)
-            event_box.connect("button-press-event", self.on_terminal_tab_clicked)
-            event_box.show_all()
-            
-            self.terminal_notebook.append_page(frame, event_box)
-            new_page_num = self.terminal_notebook.page_num(frame)
-            GLib.idle_add(self.terminal_notebook.set_current_page, new_page_num)
-            self.terminals[key] = {'frame': frame, 'terminal': terminal}
+        # 3. Graceful Close Logic (The previous fix)
+        def close_tab(_):
+            # A. Unregister from dictionary immediately
+            self.terminals.pop(key, None)
+
+            # B. CASCADE SHUTDOWN
+            # If "Core" tab is closed manually, kill dependencies
+            if key == "core":
+                if self.ue_running:
+                    self.toggle_ue_process(None)
+                if self.gnb_running:
+                    self.toggle_gnb_process(None, force=True) # Force used here
+                if self.core_running:
+                    self.toggle_core_process(None, force=True)
+                    self.core_terminal_ref = None
+            else:
+                # Normal stop for other tabs
+                if key == "ue" and self.ue_running: 
+                    self.toggle_ue_process(None)
+                    self.ue_terminal_ref = None
+                elif key == "gnb" and self.gnb_running: 
+                    self.toggle_gnb_process(None)
+                    self.gnb_terminal_ref = None
+                elif key == "tshark" and self.tshark_running: 
+                    self.toggle_tshark_process(None)
+                    self.tshark_terminal_ref = None
+
+            # C. Define Destruction Logic
+            def do_destroy(*args):
+                if self.terminal_notebook:
+                    page = self.terminal_notebook.page_num(frame)
+                    if page != -1: 
+                        self.terminal_notebook.remove_page(page)
+                GLib.idle_add(frame.destroy)
+                return False
+
+            # D. Wait for process death before hiding UI
+            if terminal.get_pty() is not None:
+                btn_close.set_sensitive(False)
+                lbl.set_text(f"{title} (Stopping...)")
+                # We use a local handler for the CLOSE BUTTON destroy logic
+                terminal.connect("child-exited", do_destroy)
+                GLib.timeout_add_seconds(2, do_destroy)
+            else:
+                do_destroy()
+
+        btn_close.connect("clicked", close_tab)
+        vbox.pack_start(header, False, False, 0)
+        
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.add(terminal)
+        vbox.pack_start(scrolled, True, True, 0)
+        frame.add(vbox)
+
+        # Tab Label Click Event
+        tab_label = Gtk.Label(label=title)
+        event_box = Gtk.EventBox()
+        event_box.add(tab_label)
+        event_box.connect("button-press-event", self.on_terminal_tab_clicked)
+        event_box.show_all()
+        
+        self.terminal_notebook.append_page(frame, event_box)
+        new_page_num = self.terminal_notebook.page_num(frame)
+        GLib.idle_add(self.terminal_notebook.set_current_page, new_page_num)
+        
+        # Store valid reference
+        self.terminals[key] = {'frame': frame, 'terminal': terminal}
         
         self.terminal_notebook.show_all()
         return terminal
@@ -1129,24 +1554,392 @@ class SrsRanGuiApp(Gtk.Window):
     def _send_commands_sequentially(self, terminal, commands, scheduler_id_attr, delay=1000, on_complete=None):
         command_queue = list(commands)
         def send_next():
+            if self.is_closing:
+                setattr(self, scheduler_id_attr, None)
+                return False
+
+            # Check if terminal is still valid and realized (Safe check)
+            if not terminal or not terminal.get_realized(): 
+                setattr(self, scheduler_id_attr, None)
+                return False
+
             if not command_queue:
                 if on_complete: on_complete()
                 setattr(self, scheduler_id_attr, None)
                 return False
+            
             cmd = command_queue.pop(0)
-            terminal.feed_child((cmd + "\n").encode())
+            try:
+                terminal.feed_child((cmd + "\n").encode())
+            except Exception:
+                # Terminal likely destroyed
+                setattr(self, scheduler_id_attr, None)
+                return False
+                
             return True
         source_id = GLib.timeout_add(delay, send_next)
         setattr(self, scheduler_id_attr, source_id)
 
+    def _browse_docker_container(self, container_name, current_path, root_path):
+        """
+        A recursive file browser for Docker containers.
+        - container_name: Name of the docker container (e.g., open5gs_5gc)
+        - current_path: The directory we are currently looking at
+        - root_path: The top-level directory (to know when to stop going 'Back')
+        """
+        # 1. Clear the core_area
+        box = self.core_area
+        for child in box.get_children():
+            box.remove(child)
+
+        # 2. List files using 'ls -p' (puts a / at the end of directories)
+        items = []
+        error_message = None
+        
+        try:
+            # sudo docker exec open5gs_5gc ls -p /open5gs/src/
+            cmd = ["sudo", "docker", "exec", container_name, "ls", "-p", current_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            output = result.stdout.strip()
+            if output:
+                items = sorted(output.split('\n'))
+        except subprocess.CalledProcessError:
+            error_message = f"Error accessing path: {current_path}"
+
+        # 3. Build UI Layout
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        
+        # --- HEADER (Path + Back Button) ---
+        hbox_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        
+        # Only show Back button if we are deeper than the root path
+        if current_path.rstrip('/') != root_path.rstrip('/'):
+            btn_back = Gtk.Button(label=".. (Up)")
+            # Calculate parent directory
+            parent_dir = os.path.dirname(current_path.rstrip('/'))
+            btn_back.connect("clicked", lambda w: self._browse_docker_container(container_name, parent_dir, root_path))
+            hbox_header.pack_start(btn_back, False, False, 0)
+            
+        lbl_path = Gtk.Label(label=f"Path: {current_path}")
+        lbl_path.get_style_context().add_class("header-title")
+        hbox_header.pack_start(lbl_path, False, False, 0)
+        vbox.pack_start(hbox_header, False, False, 0)
+        # -----------------------------------
+
+        if error_message:
+            vbox.pack_start(Gtk.Label(label=error_message), False, False, 0)
+        else:
+            listbox = Gtk.ListBox()
+            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+
+            # Separate folders and files for cleaner sorting
+            folders = [x for x in items if x.endswith('/')]
+            files = [x for x in items if not x.endswith('/')]
+            
+            # --- RENDER FOLDERS ---
+            for folder in folders:
+                row = Gtk.ListBoxRow()
+                btn = Gtk.Button(label=f"📂 {folder}") # Add folder icon
+                btn.set_alignment(0.0, 0.5)
+                btn.set_relief(Gtk.ReliefStyle.NONE)
+                
+                # Click handler: Go deeper into this directory
+                new_path = os.path.join(current_path, folder)
+                btn.connect("clicked", lambda w, p=new_path: self._browse_docker_container(container_name, p, root_path))
+                
+                row.add(btn)
+                listbox.add(row)
+
+            # --- RENDER FILES ---
+            for f in files:
+                row = Gtk.ListBoxRow()
+                btn = Gtk.Button(label=f"📄 {f}") # Add file icon
+                btn.set_alignment(0.0, 0.5)
+                btn.set_relief(Gtk.ReliefStyle.NONE)
+                
+                # Click handler: View file content
+                full_file_path = os.path.join(current_path, f)
+                btn.connect("clicked", self.on_docker_file_clicked, container_name, full_file_path, "core")
+                
+                row.add(btn)
+                listbox.add(row)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.add(listbox)
+            vbox.pack_start(scrolled, True, True, 0)
+
+        box.pack_start(vbox, True, True, 0)
+        box.show_all()
+        
+        # Ensure view is visible
+        allocation = self.content_paned.get_allocation()
+        self.content_paned.set_position(allocation.height)
+
+    def _display_docker_file_list_menu(self, area_box, container_name, directory, extension, key_prefix):
+        """
+        Lists files residing INSIDE a Docker container as buttons.
+        """
+        # 1. Clear the content area
+        for child in area_box.get_children():
+            area_box.remove(child)
+            
+        files = []
+        error_message = None
+
+        # 2. Run 'docker exec' to list files
+        try:
+            # We use 'ls -p' to identify directories (they end with /) so we can skip them
+            cmd = ["sudo", "docker", "exec", container_name, "ls", "-p", directory]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            output = result.stdout.strip()
+            
+            if output:
+                # Filter files based on extension (if provided) and ignore directories (ending in /)
+                raw_list = output.split('\n')
+                for f in raw_list:
+                    f = f.strip()
+                    if f.endswith('/'): continue # Skip directories
+                    if extension and not f.endswith(extension): continue
+                    files.append(f)
+                files.sort()
+                
+        except subprocess.CalledProcessError:
+            error_message = f"Error: Could not list files.\nIs container '{container_name}' running?"
+
+        # 3. Create the ListBox
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+
+        if error_message:
+            row = Gtk.ListBoxRow()
+            row.add(Gtk.Label(label=error_message))
+            listbox.add(row)
+        elif not files:
+            row = Gtk.ListBoxRow()
+            row.add(Gtk.Label(label=f"No files found in {directory} inside {container_name}"))
+            listbox.add(row)
+        else:
+            for f in files:
+                row = Gtk.ListBoxRow()
+                btn = Gtk.Button(label=f)
+                btn.set_alignment(0.0, 0.5)
+                btn.set_relief(Gtk.ReliefStyle.NONE)
+                
+                # Connect click to the Docker file opener
+                # We pass the full path inside the container
+                full_path_in_container = f"{directory}/{f}"
+                # Remove double slashes just in case
+                full_path_in_container = full_path_in_container.replace('//', '/')
+                
+                btn.connect("clicked", self.on_docker_file_clicked, container_name, full_path_in_container, key_prefix)
+                row.add(btn)
+                listbox.add(row)
+
+        # 4. Wrap in ScrolledWindow
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add(listbox)
+        
+        # 5. Add title and list
+        vbox_header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        lbl_title = Gtk.Label(label=f"Container: {container_name}")
+        lbl_title.get_style_context().add_class("header-title")
+        lbl_path = Gtk.Label(label=f"Path: {directory}")
+        
+        vbox_header.pack_start(lbl_title, False, False, 0)
+        vbox_header.pack_start(lbl_path, False, False, 0)
+        
+        area_box.pack_start(vbox_header, False, False, 10)
+        area_box.pack_start(scrolled, True, True, 0)
+        area_box.show_all()
+        
+        allocation = self.content_paned.get_allocation()
+        self.content_paned.set_position(allocation.height)
+
+    def on_docker_file_clicked(self, button, container_name, full_path, key_prefix):
+        """
+        Opens a terminal tab and cats the file from INSIDE the Docker container.
+        """
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        filename = os.path.basename(full_path)
+        terminal = self.create_terminal_tab(f"{key_prefix}_dock_{filename}", f"View: {filename}")
+        
+        # The command to run inside the terminal tab
+        command = f"sudo docker exec {container_name} cat {full_path}\n"
+        
+        GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
+    def _display_file_list_menu(self, area_box, directory, extension, key_prefix):
+        """
+        Generic function to list files in a directory as buttons.
+        """
+        # 1. Clear the content area (gnb_area, ue_area, etc.)
+        for child in area_box.get_children():
+            area_box.remove(child)
+            
+        # 2. Expand the user path (e.g., turn '~' into '/home/student')
+        full_dir_path = os.path.expanduser(directory)
+        
+        # 3. List files
+        if os.path.exists(full_dir_path):
+            files = sorted([f for f in os.listdir(full_dir_path) if f.endswith(extension)])
+        else:
+            files = []
+            
+        # 4. Create the ListBox for buttons
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+
+        if not files:
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label=f"No {extension} files found in {full_dir_path}")
+            lbl.set_margin_top(10)
+            lbl.set_margin_bottom(10)
+            row.add(lbl)
+            listbox.add(row)
+        else:
+            for f in files:
+                row = Gtk.ListBoxRow()
+                # Create a button for the file
+                btn = Gtk.Button(label=f)
+                btn.set_alignment(0.0, 0.5) # Align text to the left
+                # Remove button border for a cleaner list look (optional)
+                btn.set_relief(Gtk.ReliefStyle.NONE) 
+                
+                # Connect the click event
+                full_file_path = os.path.join(full_dir_path, f)
+                btn.connect("clicked", self.on_generic_file_clicked, full_file_path, key_prefix)
+                
+                row.add(btn)
+                listbox.add(row)
+
+        # 5. Wrap in ScrolledWindow
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add(listbox)
+        
+        # 6. Add title and list to the area
+        lbl_dir = Gtk.Label(label=f"Directory: {full_dir_path}")
+        lbl_dir.get_style_context().add_class("header-title")
+        lbl_dir.set_margin_bottom(10)
+        
+        area_box.pack_start(lbl_dir, False, False, 0)
+        area_box.pack_start(scrolled, True, True, 0)
+        area_box.show_all()
+        
+        # Ensure the view panel is set to show this content (hiding terminal temporarily)
+        allocation = self.content_paned.get_allocation()
+        self.content_paned.set_position(allocation.height)
+
+    def on_generic_file_clicked(self, button, full_file_path, key_prefix):
+        """
+        Opens a terminal tab and 'cats' the file when a button is clicked.
+        """
+        # 1. Switch view to terminal pane
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        
+        # 2. Extract filename for the tab title
+        filename = os.path.basename(full_file_path)
+        
+        # 3. Create the tab
+        terminal = self.create_terminal_tab(f"{key_prefix}_conf_{filename}", f"Conf: {filename}")
+        
+        # 4. Command to display the file
+        command = f"cat {full_file_path}\n"
+        
+        # 5. Execute
+        GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
+        
+    def on_delete_event(self, widget, event):
+        self.is_closing = True
+        return self.on_app_quit()
+
     def on_app_quit(self, *args):
-        if self.ue_running and self.ue_terminal_ref: self.ue_terminal_ref.feed_child(b'\x03')
-        if self.gnb_running and self.gnb_terminal_ref: self.gnb_terminal_ref.feed_child(b'\x03')
-        if self.tshark_running and self.tshark_terminal_ref: self.tshark_terminal_ref.feed_child(b'\x03')
-        Gtk.main_quit()
+        if self.is_closing and hasattr(self, '_quit_done'):
+             # Avoid re-running logic if already done
+             return False
+        
+        self.is_closing = True
+        self._quit_done = True
+        
+        # 1. Stop all schedulers/timers
+        schedulers = [
+            'process_watchdog_id', 'gnb_command_scheduler_id', 'ue_command_scheduler_id',
+            'core_monitor_scheduler_id', 'gnb_config_scheduler_id', 'ue_config_scheduler_id',
+            'core_scheduler_id', 'tshark_scheduler_id','core_logs_scheduler_id', 'core_speedtest_scheduler_id',
+            'ue_speedtest_scheduler_id', 'ue_logs_scheduler_id','gnb_logs_scheduler_id', 'grafana_scheduler_id'
+        ]
+        
+        for sched_attr in schedulers:
+            try:
+                if hasattr(self, sched_attr):
+                    sid = getattr(self, sched_attr)
+                    if sid:
+                        GLib.source_remove(sid)
+                        setattr(self, sched_attr, None)
+            except Exception:
+                pass
+
+        # 2. Stop UE (Check if running AND reference exists)
+        if self.ue_running and self.ue_terminal_ref:
+            try:
+                self.ue_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
+            except Exception:
+                pass
+            time.sleep(0.5) 
+
+        # 3. Stop gNB
+        if self.gnb_running and self.gnb_terminal_ref:
+            try:
+                self.gnb_terminal_ref.feed_child(b'\x03')
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # 4. Stop Core
+        if self.core_running and self.core_terminal_ref:
+            try:
+                self.core_terminal_ref.feed_child(b'\x03')
+            except Exception:
+                pass
+        
+        # 5. Stop Tshark (This was the cause of your crash)
+        # We added the check 'if self.tshark_terminal_ref:' to prevent the AttributeError
+        if self.tshark_running and self.tshark_terminal_ref:
+            try:
+                self.tshark_terminal_ref.feed_child(b'\x03')
+            except Exception:
+                pass
+        
+        # 6. Quit GTK
+        try:
+            Gtk.main_quit()
+        except Exception:
+            pass
+            
+        # Force exit
+        sys.exit(0)
 
 if __name__ == "__main__":
     app = SrsRanGuiApp()
+    app.connect("delete-event", app.on_delete_event)
     app.connect("destroy", app.on_app_quit)
+    
+    # GLib Signal Handlers (run in main loop)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, app.on_app_quit, None)
-    Gtk.main()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, app.on_app_quit, None)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, app.on_app_quit, None)
+
+    # Standard Signal Handlers (Fallback)
+    def signal_handler(sig, frame):
+        app.on_app_quit()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)
+
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        app.on_app_quit()
