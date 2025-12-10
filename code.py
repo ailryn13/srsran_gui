@@ -161,7 +161,7 @@ class SrsRanGuiApp(Gtk.Window):
         if not row or row.get_index() == self.current_menu_index:
             return
         
-        protected_keys = ["gnb", "ue", "tshark", "core"]
+        protected_keys = ["gnb", "ue", "tshark", "core","grafana"]
         for key in list(self.terminals.keys()):
             if key not in protected_keys:
                 if key == "tshark" and self.tshark_running:
@@ -484,27 +484,25 @@ class SrsRanGuiApp(Gtk.Window):
 
             self.gnb_button_ref.set_sensitive(False)
 
-            # 2. Start Grafana (Background Tab)
-            # We open a tab for it so you can verify it started.
+            # 2. Start Grafana (Foreground Mode)
             grafana_terminal = self.create_terminal_tab("grafana", "Grafana Service")
             self.grafana_terminal_ref = grafana_terminal
             
-            # --- GRAFANA START COMMAND ---
-            # You can change this command if you use Docker or a specific script.
+            # --- UPDATED COMMANDS ---
+            # We run grafana-server directly so Ctrl+C works.
+            # We set the homepath to ensure it finds its config files.
             grafana_cmd = [
-                "echo 'Starting Grafana Service...'",
-                "sudo systemctl start grafana-server",
-                "echo 'Grafana started.'"
+                "sudo su",
+                "cd",
+                "cd srsRAN_Project/",
+                "sudo docker compose -f docker/docker-compose.yml up grafana" 
             ]
             self._send_commands_sequentially(grafana_terminal, grafana_cmd, "grafana_scheduler_id")
             
-            # 3. Wait a moment to ensure Grafana is ready
-            # This prevents gNB from trying to push metrics before Grafana/InfluxDB is listening.
             time.sleep(2)
 
             # 4. Start gNB (Foreground Tab)
             gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
-            # Connect the gNB process exit to the cleanup handler
             self.gnb_terminal_ref = gnb_terminal
             
             ctx = self.gnb_button_ref.get_style_context()
@@ -557,15 +555,12 @@ class SrsRanGuiApp(Gtk.Window):
                 self.gnb_terminal_ref.feed_child(b'\x03') # Send Ctrl+C to gNB
             
             # 3. Stop Grafana (Step 2)
-            # We send the stop command to the Grafana terminal
+            # Now that it's running in foreground, we can just send Ctrl+C
             if self.grafana_terminal_ref:
-                stop_cmd = "sudo systemctl stop grafana-server\n"
                 try:
-                    self.grafana_terminal_ref.feed_child(stop_cmd.encode())
+                    self.grafana_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
                 except:
                     pass
-                # We don't close the tab immediately so you can see the output, 
-                # but we clear the reference so the app knows it's "off".
                 self.grafana_terminal_ref = None
 
             self.reset_gnb_button()
@@ -1557,9 +1552,7 @@ class SrsRanGuiApp(Gtk.Window):
             if self.is_closing:
                 setattr(self, scheduler_id_attr, None)
                 return False
-
-            # Check if terminal is still valid and realized (Safe check)
-            if not terminal or not terminal.get_realized(): 
+            if terminal is None: 
                 setattr(self, scheduler_id_attr, None)
                 return False
 
@@ -1893,6 +1886,14 @@ class SrsRanGuiApp(Gtk.Window):
         if self.gnb_running and self.gnb_terminal_ref:
             try:
                 self.gnb_terminal_ref.feed_child(b'\x03')
+            except Exception:
+                pass
+            time.sleep(0.5)
+        
+        # 3. Stop Grafana
+        if self.grafana_terminal_ref:
+            try:
+                self.grafana_terminal_ref.feed_child(b'\x03')
             except Exception:
                 pass
             time.sleep(0.5)
