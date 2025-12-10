@@ -84,7 +84,7 @@ class SrsRanGuiApp(Gtk.Window):
         # IP State (Removed extra IPs)
         self.gnb_link_ip = "<N/A>"
         self.ue_ip = "<N/A>"
-        self.core_ip = "127.0.0.1"
+        self.core_ip = "<N/A>"
         
         # Main layout
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -131,7 +131,10 @@ class SrsRanGuiApp(Gtk.Window):
         self.paned.set_position(280)
         self.listbox.select_row(self.listbox.get_row_at_index(0))
         
-        self.process_watchdog_id = GLib.timeout_add_seconds(2, self._check_process_status)
+        # Performance Fix: Run watchdog in a separate thread, not the main UI loop
+        self.watchdog_running = True
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+
         self.show_all()
         
     def on_content_paned_allocated(self, widget, allocation):
@@ -283,7 +286,7 @@ class SrsRanGuiApp(Gtk.Window):
         return lbl
 
     def create_ue_control_ui(self, parent_box):
-        parent_box.pack_start(self.create_title("User Equipment (UE)"), False, False, 0)
+        parent_box.pack_start(self.create_title("UE"), False, False, 0)
         
         # IP Display Frame (REMOVED: gNB Search IP)
         ip_frame = Gtk.Frame()
@@ -326,10 +329,10 @@ class SrsRanGuiApp(Gtk.Window):
     def create_gnb_control_ui(self, parent_box):
         parent_box.pack_start(self.create_title("gNB"), False, False, 0)
         
-        # IP Display Frame (REMOVED: NGAP IP)
+        # IP Display Frame
         ip_frame = Gtk.Frame()
-        self.gnb_ip_label = Gtk.Label(label=f"Link IP: {self.gnb_link_ip}")
-        # --- FIX: Replaced set_padding with set_margin_* ---
+        # CHANGED: Label is now "gNB IP"
+        self.gnb_ip_label = Gtk.Label(label=f"gNB IP: {self.gnb_link_ip}")
         self.gnb_ip_label.set_margin_top(10)
         self.gnb_ip_label.set_margin_bottom(10)
         self.gnb_ip_label.set_margin_start(10)
@@ -347,7 +350,7 @@ class SrsRanGuiApp(Gtk.Window):
         self.gnb_button_ref.connect("clicked", self.toggle_gnb_process)
         parent_box.pack_start(self.gnb_button_ref, False, False, 5)
 
-        # Web UI Button (Added below Start)
+        # Web UI Button
         gnb_webui_btn = Gtk.Button(label="Web UI")
         gnb_webui_btn.get_style_context().add_class("start-button")
         gnb_webui_btn.connect("clicked", self.on_gnb_webview)
@@ -358,9 +361,9 @@ class SrsRanGuiApp(Gtk.Window):
         
         # IP Display Frame
         ip_frame = Gtk.Frame()
-        self.core_ip_label = Gtk.Label(label=f"Core IP: {self.core_ip}")
+        # CHANGED: Label is now "AMF IP"
+        self.core_ip_label = Gtk.Label(label=f"AMF IP: {self.core_ip}")
         
-        # Apply margins
         self.core_ip_label.set_margin_top(10)
         self.core_ip_label.set_margin_bottom(10)
         self.core_ip_label.set_margin_start(10)
@@ -369,7 +372,7 @@ class SrsRanGuiApp(Gtk.Window):
         ip_frame.add(self.core_ip_label)
         parent_box.pack_start(ip_frame, False, False, 5)
 
-        # "Start" Button (Core Toggle)
+        # Start Button
         self.core_button_ref = Gtk.Button(label=f"{PLAY_SYMBOL} Start 5G Core")
         self.core_button_ref.get_style_context().add_class("start-button")
         if self.core_running:
@@ -378,7 +381,7 @@ class SrsRanGuiApp(Gtk.Window):
         self.core_button_ref.connect("clicked", self.toggle_core_process)
         parent_box.pack_start(self.core_button_ref, False, False, 5)
 
-        # Web UI Button (Added below Start)
+        # Web UI Button
         webui_btn = Gtk.Button(label="Web UI")
         webui_btn.get_style_context().add_class("start-button")
         webui_btn.connect("clicked", self.on_core_webui)
@@ -400,6 +403,7 @@ class SrsRanGuiApp(Gtk.Window):
             def startup_complete():
                 self.core_running = True
                 self.core_button_ref.set_sensitive(True)
+                self.fetch_and_display_core_ip()
 
             commands = [
                 "sudo su",
@@ -447,6 +451,7 @@ class SrsRanGuiApp(Gtk.Window):
 
     def reset_core_button(self):
         self.core_running = False
+        self.reset_core_ip_display()
         def update_ui():
             if self.is_closing: return
             if self.core_button_ref and self.core_button_ref.get_realized():
@@ -617,16 +622,19 @@ class SrsRanGuiApp(Gtk.Window):
             self.reset_ue_button()
 
     def toggle_tshark_process(self, _):
-        # Create folder if missing
+        # 1. Create capture folder
         if not os.path.exists(self.capture_folder_path):
             os.makedirs(self.capture_folder_path)
 
         if not self.tshark_running:
             self.tshark_button_ref.set_sensitive(False)
-            terminal = self.create_terminal_tab("tshark", "Tshark Capture")
+            
+            # 2. Create Terminal
+            terminal = self.create_terminal_tab("tshark", "Tshark NGAP Capture")
             terminal.connect("child-exited", self.on_process_exited, "tshark")
             self.tshark_terminal_ref = terminal
             
+            # 3. Update Button
             ctx = self.tshark_button_ref.get_style_context()
             ctx.remove_class("start-button")
             ctx.add_class("stop-button")
@@ -636,12 +644,16 @@ class SrsRanGuiApp(Gtk.Window):
                 self.tshark_running = True
                 self.tshark_button_ref.set_sensitive(True)
 
+            # 4. Generate Filename
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"srs_capture_{timestamp}.pcap"
+            filename = f"srs_ngap_{timestamp}.pcap"
             full_path = os.path.join(self.capture_folder_path, filename)
             
-            # Capture filter tailored for srsRAN/Open5GS common protocols
-            commands = [f'exec sudo tshark -i any -w {full_path}']
+            # 5. The Command
+            # -f "sctp port 38412": The Capture Filter. This guarantees the FILE contains ONLY NGAP.
+            # -Y "ngap"         : The Display Filter. This guarantees the TERMINAL shows ONLY NGAP.
+            # We can actually use BOTH to be safe: -f to keep the file small, -Y to format the output.
+            commands = [f'exec sudo tshark -i any -f "sctp port 38412" -w {full_path} -P -Y "ngap" -l']
             
             self._send_commands_sequentially(
                 terminal, 
@@ -650,12 +662,14 @@ class SrsRanGuiApp(Gtk.Window):
                 on_complete=startup_complete
             )
         else:
+            # --- STOPPING ---
             if self.tshark_scheduler_id:
                 GLib.source_remove(self.tshark_scheduler_id)
                 self.tshark_scheduler_id = None
 
             if self.tshark_terminal_ref:
-                self.tshark_terminal_ref.feed_child(b'\x03')
+                self.tshark_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
+            
             self.reset_tshark_button()
 
     def on_open_capture_folder_clicked(self, button):
@@ -672,18 +686,68 @@ class SrsRanGuiApp(Gtk.Window):
     # -------------------------------------------------------------------------
     # IP & STATUS HELPERS
     # -------------------------------------------------------------------------
+    def fetch_and_display_core_ip(self):
+        def worker_thread():
+            core_ip = "<N/A>" 
+            config_path = "/home/student/Downloads/gnb_zmq.yaml"
+            
+            try:
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        lines = f.readlines()
+                        in_amf_section = False
+                        for line in lines:
+                            clean_line = line.strip()
+                            if clean_line.startswith("amf:"):
+                                in_amf_section = True
+                                continue
+                            if in_amf_section and clean_line.startswith("addr:"):
+                                parts = clean_line.split("addr:")
+                                if len(parts) > 1:
+                                    core_ip = parts[1].split("#")[0].strip()
+                                break
+                                
+                elif self.core_running:
+                    cmd = ["sudo", "docker", "inspect", "-f", 
+                           "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", 
+                           "open5gs_5gc"]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    output = result.stdout.strip()
+                    if output: core_ip = output
+
+            except Exception:
+                pass
+
+            def update_gui():
+                if self.is_closing: return
+                self.core_ip = core_ip
+                if hasattr(self, 'core_ip_label'):
+                    # CHANGED: Update text to "AMF IP"
+                    self.core_ip_label.set_text(f"AMF IP: {self.core_ip}")
+            
+            GLib.idle_add(update_gui)
+        threading.Thread(target=worker_thread, daemon=True).start()
+
     def fetch_and_display_gnb_ips(self):
         def worker_thread():
             link_ip = "<N/A>"
+            config_path = "/home/student/Downloads/gnb_zmq.yaml"
+            
             try:
-                # srsRAN config parsing (Adjust grep pattern based on your .yaml or .conf)
-                # Assuming srsRAN Project YAML structure
-                cmd_link = "grep 'addr:' ~/srsRAN_Project/build/gnb.yaml | head -1 | awk '{print $2}'"
-                proc_link = subprocess.run(cmd_link, shell=True, capture_output=True, text=True)
-                if proc_link.stdout: link_ip = proc_link.stdout.strip()
-                
-                # Removed NGAP IP fetching as requested
-
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        lines = f.readlines()
+                        in_amf_section = False
+                        for line in lines:
+                            clean_line = line.strip()
+                            if clean_line.startswith("amf:"):
+                                in_amf_section = True
+                                continue
+                            if in_amf_section and clean_line.startswith("bind_addr:"):
+                                parts = clean_line.split("bind_addr:")
+                                if len(parts) > 1:
+                                    link_ip = parts[1].split("#")[0].strip()
+                                break
             except Exception:
                 pass
 
@@ -691,42 +755,57 @@ class SrsRanGuiApp(Gtk.Window):
                 if self.is_closing: return
                 self.gnb_link_ip = link_ip
                 if hasattr(self, 'gnb_ip_label'):
-                    self.gnb_ip_label.set_text(f"Link IP: {self.gnb_link_ip}")
+                    # CHANGED: Update text to "gNB IP"
+                    self.gnb_ip_label.set_text(f"gNB IP: {self.gnb_link_ip}")
             
             GLib.idle_add(update_gui)
         threading.Thread(target=worker_thread, daemon=True).start()
         
+    def reset_core_ip_display(self):
+        self.core_ip = "<N/A>"
+        def update_gui():
+            if self.is_closing: return
+            if hasattr(self, 'core_ip_label'):
+                # CHANGED: Reset to "AMF IP"
+                self.core_ip_label.set_text(f"AMF IP: {self.core_ip}")
+        GLib.idle_add(update_gui)
+
     def reset_gnb_ip_display(self):
         self.gnb_link_ip = "<N/A>"
         def update_gui():
             if self.is_closing: return
             if hasattr(self, 'gnb_ip_label'):
-                self.gnb_ip_label.set_text("Link IP: <N/A>")
+                # CHANGED: Reset to "gNB IP"
+                self.gnb_ip_label.set_text("gNB IP: <N/A>")
         GLib.idle_add(update_gui)
         
     def fetch_and_display_ue_ips(self):
         def worker_thread():
             ue_ip = "<N/A>"
-            try:
-                # Get IP assigned to tun_srsue interface
-                for _ in range(5):
-                    cmd_ue = "ip -4 addr show tun_srsue | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
-                    proc_ue = subprocess.run(cmd_ue, shell=True, capture_output=True, text=True)
-                    if proc_ue.stdout:
-                        ue_ip = proc_ue.stdout.strip()
-                        break
-                    time.sleep(2)
-            except Exception:
-                pass
+        
+            time.sleep(3)
 
+            try:
+                cmd = "sudo ip netns exec ue1 ip -4 addr show tun_srsue | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
+                
+                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                
+                if proc.stdout:
+                    # found the IP (e.g., 10.45.1.2)
+                    ue_ip = proc.stdout.strip()
+
+            except Exception as e:
+                print(f"Error fetching UE IP: {e}")
+
+            # 3. Update the GUI
             def update_gui():
                 if self.is_closing: return
                 self.ue_ip = ue_ip
-                # Removed gNB Search IP fetching as requested
                 if hasattr(self, 'ue_ip_label'):
                     self.ue_ip_label.set_text(f"UE IP: {self.ue_ip}")
             
             GLib.idle_add(update_gui)
+        
         threading.Thread(target=worker_thread, daemon=True).start()
 
     def reset_ue_ip_display(self):
@@ -789,28 +868,37 @@ class SrsRanGuiApp(Gtk.Window):
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
         
-    def _check_process_status(self):
-        if self.is_closing:
-            return False
+    def _watchdog_loop(self):
+        """
+        Background thread that checks process status every 2 seconds.
+        Does NOT block the GUI.
+        """
+        while self.watchdog_running:
+            time.sleep(2) # Sleep first to allow app startup
             
-        # Watchdog to reset buttons if process crashes or is stopped via Ctrl+C
-        processes = {
-            'gnb': (self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c"),
-            'ue': (self.ue_running, self.reset_ue_button, "srsue"),
-            'tshark': (self.tshark_running, self.reset_tshark_button, "tshark"),
-            # --- FIX: Use the new handler that triggers cascade shutdown ---
-            'core': (self.core_running, self.handle_core_stopped_unexpectedly, "docker compose up")
-        }
-        
-        for key, (running, func, ptrn) in processes.items():
-            if running:
-                try:
-                    # pgrep checks if the specific command is running in the background
-                    subprocess.run(['pgrep', '-f', ptrn], check=True, stdout=subprocess.DEVNULL)
-                except:
-                    # If not found, run the cleanup function
-                    GLib.idle_add(func)
-        return True
+            if self.is_closing:
+                break
+
+            # Define the checks
+            # key: (is_running_flag, cleanup_function, pgrep_pattern)
+            checks = [
+                ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c"),
+                ('ue', self.ue_running, self.reset_ue_button, "srsue"),
+                ('tshark', self.tshark_running, self.reset_tshark_button, "tshark"),
+                ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose up")
+            ]
+
+            for key, running, func, ptrn in checks:
+                if running:
+                    try:
+                        # run pgrep synchronously (safe here because we are in a background thread)
+                        subprocess.run(['pgrep', '-f', ptrn], check=True, stdout=subprocess.DEVNULL)
+                    except subprocess.CalledProcessError:
+                        # Process not found! Schedule the cleanup on the Main UI Thread
+                        print(f"Watchdog: {key} stopped unexpectedly.")
+                        GLib.idle_add(func)
+                    except Exception:
+                        pass
 
     def handle_core_stopped_unexpectedly(self):
         # This function is called by the Watchdog when it sees 
