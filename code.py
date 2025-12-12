@@ -47,6 +47,14 @@ class SrsRanGuiApp(Gtk.Window):
         self.ue_running = False
         self.ue_terminal_ref = None
         self.ue_button_ref = None
+
+        self.core_iperf_running = False
+        self.core_iperf_button_ref = None
+        self.core_iperf_start_time = 0
+
+        self.ue_iperf_running = False
+        self.ue_iperf_button_ref = None
+        self.ue_iperf_start_time = 0
         
         self.tshark_running = False
         self.tshark_terminal_ref = None
@@ -164,7 +172,7 @@ class SrsRanGuiApp(Gtk.Window):
         if not row or row.get_index() == self.current_menu_index:
             return
         
-        protected_keys = ["gnb", "ue", "tshark", "core","grafana"]
+        protected_keys = ["gnb", "ue", "tshark", "core","grafana","core_iperf","ue_iperf"]
         for key in list(self.terminals.keys()):
             if key not in protected_keys:
                 if key == "tshark" and self.tshark_running:
@@ -241,6 +249,9 @@ class SrsRanGuiApp(Gtk.Window):
         getattr(self, content_attr).set_margin_top(10)
         vbox_main.pack_start(getattr(self, content_attr), True, True, 0)
         self.content_box.pack_start(vbox_main, True, True, 0)
+        
+        # --- RETURN THE HBOX SO WE CAN ADD EXTRA BUTTONS ---
+        return hbox_buttons
 
     # -------------------------------------------------------------------------
     # NETWORK OVERVIEW - MODIFIED LAYOUT
@@ -388,6 +399,7 @@ class SrsRanGuiApp(Gtk.Window):
         parent_box.pack_start(webui_btn, False, False, 5)
 
     def toggle_core_process(self, widget, force=False):
+        self.content_paned.set_position(self.default_terminal_pane_position)
         if not self.core_running:
             # --- STARTUP LOGIC (Unchanged) ---
             self.core_button_ref.set_sensitive(False)
@@ -480,7 +492,7 @@ class SrsRanGuiApp(Gtk.Window):
 
     def toggle_gnb_process(self, widget, force=False):
         if not self.gnb_running:
-            # --- STARTUP SEQUENCE (Grafana First -> Then gNB) ---
+            # --- STARTUP SEQUENCE ---
             
             # 1. Prerequisite Check
             if not self.core_running:
@@ -493,50 +505,69 @@ class SrsRanGuiApp(Gtk.Window):
             grafana_terminal = self.create_terminal_tab("grafana", "Grafana Service")
             self.grafana_terminal_ref = grafana_terminal
             
-            # --- UPDATED COMMANDS ---
-            # We run grafana-server directly so Ctrl+C works.
-            # We set the homepath to ensure it finds its config files.
+            # Use absolute path for safety
             grafana_cmd = [
                 "sudo su",
                 "cd",
-                "cd srsRAN_Project/",
+                "cd srsRAN_Project/", 
                 "sudo docker compose -f docker/docker-compose.yml up grafana" 
             ]
             self._send_commands_sequentially(grafana_terminal, grafana_cmd, "grafana_scheduler_id")
             
-            time.sleep(2)
+            # 3. Resize Terminal (Optional, if you added this helper previously)
+            if hasattr(self, 'maximize_terminal_view'):
+                self.maximize_terminal_view()
 
-            # 4. Start gNB (Foreground Tab)
-            gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
-            self.gnb_terminal_ref = gnb_terminal
+            # --- KEY FIX: NON-BLOCKING DELAY ---
+            # Instead of time.sleep(2), we define the gNB startup as a separate function
+            # and schedule it to run in 2000ms (2 seconds).
             
-            ctx = self.gnb_button_ref.get_style_context()
-            ctx.remove_class("start-button")
-            ctx.add_class("stop-button")
-            self.gnb_button_ref.set_label(f"{STOP_SYMBOL} Stop gNB")
+            def start_gnb_delayed():
+                if self.is_closing: return False
 
-            def startup_complete():
-                self.gnb_running = True
-                self.gnb_button_ref.set_sensitive(True)
-                self.fetch_and_display_gnb_ips()
+                # 4. Start gNB (Foreground Tab)
+                gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
+                self.gnb_terminal_ref = gnb_terminal
+                
+                # Update Button Style
+                ctx = self.gnb_button_ref.get_style_context()
+                ctx.remove_class("start-button")
+                ctx.add_class("stop-button")
+                self.gnb_button_ref.set_label(f"{STOP_SYMBOL} Stop gNB")
 
-            commands = [
-                "sudo su",
-                "cd",
-                "cd ~/srsRAN_Project/build/app/gnb",
-                "sudo gnb -c  /home/student/Downloads/gnb_zmq.yaml"
-            ]
-            self._send_commands_sequentially(
-                gnb_terminal,
-                commands,
-                "gnb_command_scheduler_id",
-                delay=1000,
-                on_complete=startup_complete
-            )
+                def startup_complete():
+                    self.gnb_running = True
+                    self.gnb_button_ref.set_sensitive(True)
+                    self.fetch_and_display_gnb_ips()
+
+                commands = [
+                    "sudo su",
+                    "cd",
+                    "cd srsRAN_Project/build/apps/gnb", # Absolute path
+                    "sudo gnb -c /home/student/Downloads/gnb_zmq.yaml" # Absolute path
+                ]
+                
+                self._send_commands_sequentially(
+                    gnb_terminal,
+                    commands,
+                    "gnb_command_scheduler_id",
+                    delay=1000,
+                    on_complete=startup_complete
+                )
+                
+                # If you want the view to switch to the new gNB tab:
+                if hasattr(self, 'maximize_terminal_view'):
+                    self.maximize_terminal_view()
+                    
+                return False # Run once
+
+            # Schedule the gNB start for 2 seconds later (allows Grafana to init)
+            GLib.timeout_add(2000, start_gnb_delayed)
+            
         else:
-            # --- STOPPING SEQUENCE (gNB First -> Then Grafana) ---
+            # --- STOPPING SEQUENCE (Unchanged) ---
             
-            # 1. Safety Check (UE must be stopped first)
+            # 1. Safety Check
             if not force and self.ue_running:
                 dialog = Gtk.MessageDialog(
                     transient_for=self,
@@ -552,18 +583,17 @@ class SrsRanGuiApp(Gtk.Window):
                 dialog.destroy()
                 return 
             
-            # 2. Stop gNB (Step 1)
+            # 2. Stop gNB
             if self.gnb_command_scheduler_id:
                 GLib.source_remove(self.gnb_command_scheduler_id)
                 self.gnb_command_scheduler_id = None
             if self.gnb_terminal_ref:
-                self.gnb_terminal_ref.feed_child(b'\x03') # Send Ctrl+C to gNB
+                self.gnb_terminal_ref.feed_child(b'\x03') 
             
-            # 3. Stop Grafana (Step 2)
-            # Now that it's running in foreground, we can just send Ctrl+C
+            # 3. Stop Grafana
             if self.grafana_terminal_ref:
                 try:
-                    self.grafana_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
+                    self.grafana_terminal_ref.feed_child(b'\x03') 
                 except:
                     pass
                 self.grafana_terminal_ref = None
@@ -571,6 +601,7 @@ class SrsRanGuiApp(Gtk.Window):
             self.reset_gnb_button()
 
     def toggle_ue_process(self, _):
+        self.content_paned.set_position(self.default_terminal_pane_position)
         if not self.ue_running:
             # Check Core First
             if not self.core_running:
@@ -597,15 +628,20 @@ class SrsRanGuiApp(Gtk.Window):
                 self.ue_button_ref.set_sensitive(True)
                 self.fetch_and_display_ue_ips()
 
-            # srsRAN 5G UE command
+            # --- MODIFIED SECTION: SILENT CHECK ---
+            # "grep -q" checks silently. 
+            # "||" means "OR": if the first part fails (UE not found), run the second part (add it).
+            silent_check_cmd = "ip netns list | grep -q 'ue1' || ip netns add ue1"
+
             commands = [
                 "sudo su",
                 "cd",
-                "sudo ip netns list",
-                "sudo ip netns add ue1",
-                "cd /srsRAN_4G/build/srsue/src",
+                silent_check_cmd,               # <--- Runs silently
+                "cd srsRAN_4G/build/srsue/src",
                 "sudo srsue /home/student/Downloads/ue_zmq.conf"
             ]
+            # --------------------------------------
+
             self._send_commands_sequentially(
                 terminal,
                 commands,
@@ -622,19 +658,29 @@ class SrsRanGuiApp(Gtk.Window):
             self.reset_ue_button()
 
     def toggle_tshark_process(self, _):
-        # 1. Create capture folder
+        self.content_paned.set_position(self.default_terminal_pane_position)
+        # 1. Ensure capture folder exists (We will move the file here later)
         if not os.path.exists(self.capture_folder_path):
-            os.makedirs(self.capture_folder_path)
+            try:
+                os.makedirs(self.capture_folder_path)
+                # Ensure the folder is owned by the user
+                sudo_user = os.environ.get('SUDO_USER')
+                if sudo_user:
+                    import pwd
+                    pw = pwd.getpwnam(sudo_user)
+                    os.chown(self.capture_folder_path, pw.pw_uid, pw.pw_gid)
+            except Exception:
+                pass
 
         if not self.tshark_running:
+            # --- STARTUP ---
             self.tshark_button_ref.set_sensitive(False)
             
-            # 2. Create Terminal
             terminal = self.create_terminal_tab("tshark", "Tshark NGAP Capture")
             terminal.connect("child-exited", self.on_process_exited, "tshark")
             self.tshark_terminal_ref = terminal
             
-            # 3. Update Button
+            # Update Button
             ctx = self.tshark_button_ref.get_style_context()
             ctx.remove_class("start-button")
             ctx.add_class("stop-button")
@@ -644,16 +690,16 @@ class SrsRanGuiApp(Gtk.Window):
                 self.tshark_running = True
                 self.tshark_button_ref.set_sensitive(True)
 
-            # 4. Generate Filename
+            # --- KEY FIX 1: CAPTURE TO /tmp FIRST ---
+            # AppArmor allows tshark to write to /tmp without issues.
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             filename = f"srs_ngap_{timestamp}.pcap"
-            full_path = os.path.join(self.capture_folder_path, filename)
             
-            # 5. The Command
-            # -f "sctp port 38412": The Capture Filter. This guarantees the FILE contains ONLY NGAP.
-            # -Y "ngap"         : The Display Filter. This guarantees the TERMINAL shows ONLY NGAP.
-            # We can actually use BOTH to be safe: -f to keep the file small, -Y to format the output.
-            commands = [f'exec sudo tshark -i any -f "sctp port 38412" -w {full_path} -P -Y "ngap" -l']
+            self.temp_pcap_path = f"/tmp/{filename}"
+            self.final_pcap_path = os.path.join(self.capture_folder_path, filename)
+            
+            # Run tshark pointing to the TEMP path
+            commands = [f'sudo tshark -i any -f "sctp port 38412" -w "{self.temp_pcap_path}" -P']
             
             self._send_commands_sequentially(
                 terminal, 
@@ -663,14 +709,51 @@ class SrsRanGuiApp(Gtk.Window):
             )
         else:
             # --- STOPPING ---
+            
+            # --- KEY FIX 2: Tell Watchdog to ignore Tshark IMMEDIATELY ---
+            # This prevents the "Watchdog: tshark stopped unexpectedly" error.
+            self.tshark_running = False 
+            
+            # Disable button and show status while we save
+            self.tshark_button_ref.set_sensitive(False)
+            self.tshark_button_ref.set_label("Saving...")
+
             if self.tshark_scheduler_id:
                 GLib.source_remove(self.tshark_scheduler_id)
                 self.tshark_scheduler_id = None
 
+            # Kill the process
             if self.tshark_terminal_ref:
-                self.tshark_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
+                try:
+                    self.tshark_terminal_ref.feed_child(b'\x03') 
+                except:
+                    pass
             
-            self.reset_tshark_button()
+            # Wait and Move (Bypasses AppArmor)
+            def move_capture_file():
+                try:
+                    if hasattr(self, 'temp_pcap_path') and os.path.exists(self.temp_pcap_path):
+                        # FIX: Use 'sudo mv' via subprocess instead of shutil.move
+                        # This works even if the script is running as a normal user.
+                        subprocess.run(["sudo", "mv", self.temp_pcap_path, self.final_pcap_path], check=True)
+                        
+                        # FIX: Change ownership to the real user
+                        # (Because 'sudo mv' keeps the file owned by root)
+                        real_user = os.environ.get('SUDO_USER') or os.environ.get('USER')
+                        if real_user:
+                            subprocess.run(["sudo", "chown", f"{real_user}:{real_user}", self.final_pcap_path], check=True)
+                            
+                    else:
+                        print("Warning: No capture file found in /tmp")
+                except Exception as e:
+                    print(f"Error moving capture file: {e}")
+                
+                # Restore button state
+                self.reset_tshark_button()
+                return False # Run once
+
+            # Schedule the move operation (1.5s delay allows tshark to close file)
+            GLib.timeout_add(1500, move_capture_file)
 
     def on_open_capture_folder_clicked(self, button):
         try:
@@ -782,26 +865,41 @@ class SrsRanGuiApp(Gtk.Window):
     def fetch_and_display_ue_ips(self):
         def worker_thread():
             ue_ip = "<N/A>"
-        
-            time.sleep(3)
-
-            try:
-                cmd = "sudo ip netns exec ue1 ip -4 addr show tun_srsue | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
+            # FIX: Retry loop (Try for 15 seconds)
+            max_retries = 15
+            
+            for _ in range(max_retries):
+                if self.is_closing: break
                 
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                # Attempt 1: Check inside 'ue1' namespace
+                try:
+                    cmd_ns = "sudo ip netns exec ue1 ip -4 addr show tun_srsue | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
+                    proc = subprocess.run(cmd_ns, shell=True, capture_output=True, text=True)
+                    if proc.stdout.strip():
+                        ue_ip = proc.stdout.strip()
+                        break 
+                except Exception:
+                    pass
+
+                # Attempt 2: Check on Host (Fallback)
+                if ue_ip == "<N/A>":
+                    try:
+                        cmd_host = "ip -4 addr show tun_srsue | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
+                        proc = subprocess.run(cmd_host, shell=True, capture_output=True, text=True)
+                        if proc.stdout.strip():
+                            ue_ip = proc.stdout.strip()
+                            break 
+                    except Exception:
+                        pass
                 
-                if proc.stdout:
-                    # found the IP (e.g., 10.45.1.2)
-                    ue_ip = proc.stdout.strip()
+                time.sleep(1) # Wait 1s before retrying
 
-            except Exception as e:
-                print(f"Error fetching UE IP: {e}")
-
-            # 3. Update the GUI
+            # Update GUI
             def update_gui():
                 if self.is_closing: return
                 self.ue_ip = ue_ip
-                if hasattr(self, 'ue_ip_label'):
+                # Check if label exists and is valid
+                if hasattr(self, 'ue_ip_label') and self.ue_ip_label:
                     self.ue_ip_label.set_text(f"UE IP: {self.ue_ip}")
             
             GLib.idle_add(update_gui)
@@ -809,6 +907,9 @@ class SrsRanGuiApp(Gtk.Window):
         threading.Thread(target=worker_thread, daemon=True).start()
 
     def reset_ue_ip_display(self):
+        # FIX: Reset the persistent variable too
+        self.ue_ip = "<N/A>"
+        
         def update_gui():
             if self.is_closing: return
             if hasattr(self, 'ue_ip_label'):
@@ -859,6 +960,17 @@ class SrsRanGuiApp(Gtk.Window):
 
         if key == "gnb" and self.gnb_running:
             self.reset_gnb_button()
+            if self.grafana_terminal_ref:
+                try:
+                    self.grafana_terminal_ref.feed_child(b'\x03')
+                except Exception:
+                    pass
+                self.grafana_terminal_ref = None
+        elif key == "grafana":
+            if self.ue_running:
+                self.toggle_ue_process(None) # Auto stop UE if gNB dies
+            if self.gnb_running:
+                self.toggle_gnb_process(None, force=True) # Auto stop gNB if gNB dies
         elif key == "ue" and self.ue_running:
             self.reset_ue_button()
         elif key == "core" and self.core_running:
@@ -867,38 +979,68 @@ class SrsRanGuiApp(Gtk.Window):
             self.handle_core_stopped_unexpectedly()
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
-        
+        elif key == "core_iperf":
+            self.reset_core_iperf_button()
+        elif key == "ue_iperf":
+            self.reset_ue_iperf_button()
+
+    def _check_process_running_native(self, pattern):
+        """
+        Optimization: Checks if a process is running by reading /proc directly.
+        This avoids the overhead of spawning a 'pgrep' subprocess 4 times per loop.
+        """
+        try:
+            # Iterate over all PIDs in /proc
+            for pid in os.listdir('/proc'):
+                if pid.isdigit():
+                    try:
+                        # Read the command line arguments for the process
+                        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                            # Arguments are separated by null bytes (\x00)
+                            content = f.read()
+                            if not content: continue
+                            
+                            # Decode and format as a single string
+                            cmd_str = content.replace(b'\x00', b' ').decode('utf-8', errors='ignore')
+                            
+                            if pattern in cmd_str:
+                                return True
+                    except (FileNotFoundError, PermissionError, OSError):
+                        # Process might have died while we were checking, just skip
+                        continue
+        except Exception:
+            pass
+        return False
+    
     def _watchdog_loop(self):
-        """
-        Background thread that checks process status every 2 seconds.
-        Does NOT block the GUI.
-        """
         while self.watchdog_running:
-            time.sleep(2) # Sleep first to allow app startup
+            time.sleep(2) # Keep the 2-second interval
             
             if self.is_closing:
                 break
 
-            # Define the checks
-            # key: (is_running_flag, cleanup_function, pgrep_pattern)
+            # key: (is_running_flag, cleanup_function, pattern)
             checks = [
-                ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c"),
-                ('ue', self.ue_running, self.reset_ue_button, "srsue"),
-                ('tshark', self.tshark_running, self.reset_tshark_button, "tshark"),
-                ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose up")
+                ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c",None),
+                ('ue', self.ue_running, self.reset_ue_button, "srsue",None),
+                ('tshark', self.tshark_running, self.reset_tshark_button, "tshark",None),
+                # Note: "docker compose" often appears as "docker-compose" or just "docker" depending on version
+                ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose",None),
+                ('core_iperf', self.core_iperf_running, self.reset_core_iperf_button, "iperf3 -s",'core_iperf_start_time'),
+                ('ue_iperf', self.ue_iperf_running, self.reset_ue_iperf_button, "iperf3 -c",'ue_iperf_start_time')
             ]
-
-            for key, running, func, ptrn in checks:
-                if running:
-                    try:
-                        # run pgrep synchronously (safe here because we are in a background thread)
-                        subprocess.run(['pgrep', '-f', ptrn], check=True, stdout=subprocess.DEVNULL)
-                    except subprocess.CalledProcessError:
-                        # Process not found! Schedule the cleanup on the Main UI Thread
-                        print(f"Watchdog: {key} stopped unexpectedly.")
-                        GLib.idle_add(func)
-                    except Exception:
-                        pass
+            try:
+                for key, running, func, ptrn, grace_attr in checks:
+                    if running:
+                        if grace_attr:
+                            start_ts = getattr(self, grace_attr, 0)
+                            if time.time() - start_ts < 15:
+                                continue
+                        # USE THE NEW OPTIMIZED CHECK
+                        if not self._check_process_running_native(ptrn):
+                            GLib.idle_add(func)
+            except Exception as e:
+                print(f"Watchdog Error: {e}")       
 
     def handle_core_stopped_unexpectedly(self):
         # This function is called by the Watchdog when it sees 
@@ -917,6 +1059,13 @@ class SrsRanGuiApp(Gtk.Window):
 
     def handle_gnb_stopped_unexpectedly(self):
         self.reset_gnb_button()
+        if self.grafana_terminal_ref:
+            try:
+                self.grafana_terminal_ref.feed_child(b'\x03')
+            except Exception:
+                pass
+            self.grafana_terminal_ref = None
+
         if self.ue_running:
             self.toggle_ue_process(None) # Auto stop UE if gNB dies
 
@@ -924,14 +1073,33 @@ class SrsRanGuiApp(Gtk.Window):
     # SUBMENU LOGIC
     # -------------------------------------------------------------------------
     def show_core_menu(self):
+        # Removed "Speedtest" from this list
         items = [
             ("Docker", self.on_core_docker_menu),
             ("Config", self.on_core_config),
             ("Logs", self.on_core_logs),
             ("Web UI", self.on_core_webui),
-            ("Speedtest", self.on_core_speedtest),
         ]
-        self.add_toolbar_with_content(items, "core_area", "core_buttons")
+        
+        # Capture the button container
+        hbox = self.add_toolbar_with_content(items, "core_area", "core_buttons")
+
+        # --- ADD DIRECT SPEEDTEST TOGGLE BUTTON ---
+        self.core_iperf_button_ref = Gtk.Button(label=f"{PLAY_SYMBOL} Start Speedtest")
+        self.core_iperf_button_ref.set_size_request(180, 40) # Slightly wider
+        
+        # Set Initial State
+        if self.core_iperf_running:
+            self.core_iperf_button_ref.set_label(f"{STOP_SYMBOL} Stop Speedtest")
+            self.core_iperf_button_ref.get_style_context().add_class("stop-button")
+        else:
+            self.core_iperf_button_ref.get_style_context().add_class("start-button")
+
+        self.core_iperf_button_ref.connect("clicked", self.toggle_core_iperf)
+        
+        # Pack it at the end of the toolbar
+        hbox.pack_start(self.core_iperf_button_ref, False, False, 0)
+        hbox.show_all()
 
     def on_core_docker_menu(self, _):
         # 1. Clear the 'core_area' (the content box below the main buttons)
@@ -1002,80 +1170,87 @@ class SrsRanGuiApp(Gtk.Window):
         self._run_simple_command(terminal, command)
 
     def on_docker_networks(self, _):
-        # 1. Clear the content area
+        # 1. Clear the content area immediately so the user sees something happening
         box = self.core_area
         for child in box.get_children():
             box.remove(child)
-
-        # 2. Fetch network names
-        networks = []
-        error_message = None
-        try:
-            cmd = ["sudo", "docker", "network", "ls", "--format", "{{.Name}}"]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            output = result.stdout.strip()
-            if output:
-                networks = sorted(output.split('\n'))
-        except subprocess.CalledProcessError:
-            error_message = "Error: Could not list Docker networks.\nIs the Docker daemon running?"
-
-        # 3. Create the UI Layout
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         
-        # --- HEADER SECTION (Back Button + Title) ---
-        hbox_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        
-        # Back Button
-        btn_back = Gtk.Button(label="Back")
-        # When clicked, reload the Docker menu (the 2x2 grid)
-        btn_back.connect("clicked", self.on_core_docker_menu)
-        hbox_header.pack_start(btn_back, False, False, 0)
-        
-        # Title
-        lbl = Gtk.Label(label="Docker Networks")
-        lbl.get_style_context().add_class("header-title")
-        hbox_header.pack_start(lbl, False, False, 0)
-        
-        vbox.pack_start(hbox_header, False, False, 0)
-        # ---------------------------------------------
-
-        # Handle errors or empty lists
-        if error_message:
-            lbl_err = Gtk.Label(label=error_message)
-            vbox.pack_start(lbl_err, False, False, 0)
-        elif not networks:
-            lbl_empty = Gtk.Label(label="No networks found.")
-            vbox.pack_start(lbl_empty, False, False, 0)
-        else:
-            # Create a scrolling list of buttons
-            listbox = Gtk.ListBox()
-            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-            
-            for net_name in networks:
-                row = Gtk.ListBoxRow()
-                
-                # Create the button for the network
-                btn = Gtk.Button(label=net_name)
-                btn.set_alignment(0.0, 0.5) # Align text to the left
-                btn.set_relief(Gtk.ReliefStyle.NONE) # Flat look
-                
-                # Connect the click event to our inspect handler
-                btn.connect("clicked", self.on_network_inspect_clicked, net_name)
-                
-                row.add(btn)
-                listbox.add(row)
-                
-            scrolled = Gtk.ScrolledWindow()
-            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            scrolled.add(listbox)
-            vbox.pack_start(scrolled, True, True, 0)
-
-        box.pack_start(vbox, True, True, 0)
+        # Show a "Loading..." spinner or label
+        loading_lbl = Gtk.Label(label="Loading Docker Networks...")
+        box.pack_start(loading_lbl, True, True, 20)
         box.show_all()
-        
-        # 4. Ensure we are viewing the list
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
+
+        # 2. Define the heavy work
+        def fetch_networks_background():
+            networks = []
+            error_message = None
+            try:
+                # This is the line that used to freeze the GUI
+                cmd = ["sudo", "docker", "network", "ls", "--format", "{{.Name}}"]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                output = result.stdout.strip()
+                if output:
+                    networks = sorted(output.split('\n'))
+            except subprocess.CalledProcessError:
+                error_message = "Error: Could not list Docker networks.\nIs the Docker daemon running?"
+            except Exception as e:
+                error_message = f"Error: {str(e)}"
+
+            # 3. Schedule the UI update back on the main thread
+            GLib.idle_add(update_ui, networks, error_message)
+
+        # 4. Define the UI Update logic
+        def update_ui(networks, error_message):
+            if self.is_closing: return
+            
+            # Remove "Loading..." label
+            for child in box.get_children():
+                box.remove(child)
+
+            # --- HEADER ---
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            hbox_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            btn_back = Gtk.Button(label="Back")
+            btn_back.connect("clicked", self.on_core_docker_menu)
+            hbox_header.pack_start(btn_back, False, False, 0)
+            lbl = Gtk.Label(label="Docker Networks")
+            lbl.get_style_context().add_class("header-title")
+            hbox_header.pack_start(lbl, False, False, 0)
+            vbox.pack_start(hbox_header, False, False, 0)
+
+            # --- CONTENT ---
+            if error_message:
+                lbl_err = Gtk.Label(label=error_message)
+                vbox.pack_start(lbl_err, False, False, 0)
+            elif not networks:
+                lbl_empty = Gtk.Label(label="No networks found.")
+                vbox.pack_start(lbl_empty, False, False, 0)
+            else:
+                listbox = Gtk.ListBox()
+                listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+                for net_name in networks:
+                    row = Gtk.ListBoxRow()
+                    btn = Gtk.Button(label=net_name)
+                    if isinstance(btn.get_child(), Gtk.Label):
+                        btn.get_child().set_xalign(0.0)
+                    btn.set_relief(Gtk.ReliefStyle.NONE)
+                    btn.connect("clicked", self.on_network_inspect_clicked, net_name)
+                    row.add(btn)
+                    listbox.add(row)
+                
+                scrolled = Gtk.ScrolledWindow()
+                scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+                scrolled.add(listbox)
+                vbox.pack_start(scrolled, True, True, 0)
+
+            box.pack_start(vbox, True, True, 0)
+            box.show_all()
+            
+            allocation = self.content_paned.get_allocation()
+            self.content_paned.set_position(allocation.height)
+
+        # 5. Start the thread
+        threading.Thread(target=fetch_networks_background, daemon=True).start()
 
     def on_network_inspect_clicked(self, button, network_name):
         # 1. Switch to terminal view
@@ -1122,13 +1297,32 @@ class SrsRanGuiApp(Gtk.Window):
         self.add_toolbar_with_content(items, "gnb_area", "gnb_buttons")
 
     def show_ue_menu(self):
+        # Removed "Speedtest" from this list
         items = [
             ("Config", self.on_ue_config),
             ("Logs", self.on_ue_logs),
             ("Pcap", self.on_ue_pcap),
-            ("Speedtest", self.on_ue_speedtest),
         ]
-        self.add_toolbar_with_content(items, "ue_area", "ue_buttons")
+        
+        # Capture the button container
+        hbox = self.add_toolbar_with_content(items, "ue_area", "ue_buttons")
+
+        # --- ADD DIRECT SPEEDTEST TOGGLE BUTTON ---
+        self.ue_iperf_button_ref = Gtk.Button(label=f"{PLAY_SYMBOL} Start Speedtest")
+        self.ue_iperf_button_ref.set_size_request(180, 40)
+        
+        # Set Initial State
+        if self.ue_iperf_running:
+            self.ue_iperf_button_ref.set_label(f"{STOP_SYMBOL} Stop Speedtest")
+            self.ue_iperf_button_ref.get_style_context().add_class("stop-button")
+        else:
+            self.ue_iperf_button_ref.get_style_context().add_class("start-button")
+
+        self.ue_iperf_button_ref.connect("clicked", self.toggle_ue_iperf)
+        
+        # Pack it at the end of the toolbar
+        hbox.pack_start(self.ue_iperf_button_ref, False, False, 0)
+        hbox.show_all()
 
     def on_gnb_logs(self, _):
         # 1. Switch to terminal view
@@ -1231,48 +1425,62 @@ class SrsRanGuiApp(Gtk.Window):
         lbl = Gtk.Label(label="Pcap functionality coming soon")
         box.pack_start(lbl, True, True, 0)
         box.show_all()
-    def on_ue_speedtest(self, _):
-        # 1. Switch to terminal view
+
+    def toggle_ue_iperf(self, widget):
+        # Ensure we switch to terminal view so user sees the result
         self.content_paned.set_position(self.default_terminal_pane_position)
         
-        # 2. Clear previous content
-        box = self.ue_area
-        for child in box.get_children():
-            box.remove(child)
+        if not self.ue_iperf_running:
+            # --- START ---
+            terminal = self.create_terminal_tab("ue_iperf", "UE iPerf Client")
+            self.ue_iperf_running = True
+            self.ue_iperf_start_time = time.time()
+            
+            # Update Button to Red/Stop
+            widget.set_label(f"{STOP_SYMBOL} Stop Speedtest")
+            ctx = widget.get_style_context()
+            ctx.remove_class("start-button")
+            ctx.add_class("stop-button")
 
-        # 3. Create the tab
-        terminal = self.create_terminal_tab("ue_speedtest", "UE 5G Speedtest")
-        
-        # 4. Define Command Logic
-        # We combine this into a single block to ensure variables (like IP) persist.
-        # It finds the UE IP, then uses 'nr-binder' to force traffic through that IP.
-        
-        bash_script = (
-            "echo '--- Checking Prerequisites ---'; "
-            "if ! command -v speedtest-cli &> /dev/null; then "
-            "   echo 'Tool speedtest-cli not found. Installing now...'; "
-            "   sudo apt-get update && sudo apt-get install -y speedtest-cli; "
-            "fi; "
-            
-            "echo '--- Locating UE Interface (uesimtun0) ---'; "
-            # Extract IP address of uesimtun0
-            "UE_IP=$(ip -4 addr show uesimtun0 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'); "
-            
-            "if [ -z \"$UE_IP\" ]; then "
-            "   echo 'Error: Could not find IP for uesimtun0.'; "
-            "   echo 'Is the UE running? Please Start UE first.'; "
-            "else "
-            "   echo \"UE IP Found: $UE_IP\"; "
-            "   echo '--- Running Speedtest via 5G Tunnel ---'; "
-            "   cd ~/UERANSIM/build; "
-            # Use nr-binder to bind the speedtest to the UE's IP
-            "   sudo ./nr-binder $UE_IP speedtest-cli --simple; "
-            "fi"
-        )
-        
-        # 5. Execute
-        # Pass as a single list item so it runs as one script block
-        self._send_commands_sequentially(terminal, [bash_script], "ue_speedtest_scheduler_id")
+            commands = [
+                "sudo su",
+                "ip route show | grep -q '10.45.0.0/16' && sudo ip route del 10.45.0.0/16 || true",
+                "sudo ip route add 10.45.0.0/16 via 10.53.1.2",
+                "route -n",
+                "sudo ip netns exec ue1 ip route add default via 10.45.1.1 dev tun_srsue",
+                "sudo ip netns exec ue1 route -n",
+                "sudo ip netns exec ue1 iperf3 -c 10.53.1.1 -i 1 -t 60 -b 60M -R"
+            ]
+            self._send_commands_sequentially(terminal, commands, "ue_speedtest_scheduler_id", delay=400)
+        else:
+            # --- STOP ---
+            if "ue_iperf" in self.terminals:
+                # Send Ctrl+C
+                term = self.terminals["ue_iperf"]['terminal']
+                try:
+                    term.feed_child(b'\x03')
+                except:
+                    pass
+                
+                # Optional: Destroy tab immediately or let it linger so user can see results
+                # To close immediately:
+                # self.terminals["ue_iperf"]['frame'].destroy()
+                # self.terminals.pop("ue_iperf", None)
+
+            self.reset_ue_iperf_button()
+
+    def reset_ue_iperf_button(self):
+        self.ue_iperf_running = False
+        def update_ui():
+            if self.is_closing: return
+            # Check if the button exists (user might have switched menus)
+            if self.ue_iperf_button_ref and self.ue_iperf_button_ref.get_realized():
+                self.ue_iperf_button_ref.set_sensitive(True)
+                ctx = self.ue_iperf_button_ref.get_style_context()
+                ctx.remove_class("stop-button")
+                ctx.add_class("start-button")
+                self.ue_iperf_button_ref.set_label(f"{PLAY_SYMBOL} Start Speedtest")
+        GLib.idle_add(update_ui)
 
     def on_gnb_pcap(self, _):
         # Placeholder for Pcap
@@ -1380,46 +1588,54 @@ class SrsRanGuiApp(Gtk.Window):
         # - less -R: Opens the reader in "Raw" mode to preserve colors
         # - +G: (Optional) Auto-scroll to the very bottom (most recent logs)
         commands = [
+            "sudo su",
             "cd",
             "cd srsRAN_Project/docker",
-            "sudo docker compose ps",
             "sudo docker logs open5gs_5gc 2>&1 | less -R +G" 
         ]
         
         # 5. Execute
         self._send_commands_sequentially(terminal, commands, "core_logs_scheduler_id")
-    
-    def on_core_speedtest(self, _):
-        # 1. Switch to terminal view
+
+    def toggle_core_iperf(self, widget):
         self.content_paned.set_position(self.default_terminal_pane_position)
         
-        # 2. Clear previous content
-        box = self.core_area
-        for child in box.get_children():
-            box.remove(child)
+        if not self.core_iperf_running:
+            # --- START ---
+            terminal = self.create_terminal_tab("core_iperf", "Core iPerf Server")
+            self.core_iperf_running = True
+            self.core_iperf_start_time = time.time()
+            
+            # Update Button to Red/Stop
+            widget.set_label(f"{STOP_SYMBOL} Stop Speedtest")
+            ctx = widget.get_style_context()
+            ctx.remove_class("start-button")
+            ctx.add_class("stop-button")
 
-        # 3. Create the tab
-        terminal = self.create_terminal_tab("core_speedtest", "Network Speedtest")
-        
-        # 4. Define Commands
-        # This script checks if 'speedtest-cli' is installed. 
-        # If not, it installs it automatically before running the test.
-        commands = [
-            "echo '--- Checking Internet Connectivity ---'",
-            "if ! command -v speedtest-cli &> /dev/null; then",
-            "    echo 'Tool `speedtest-cli` not found. Installing now...'",
-            "    sudo apt-get update && sudo apt-get install -y speedtest-cli",
-            "fi",
-            "echo '--------------------------------------'",
-            "echo 'Running Speedtest... Please wait...'",
-            "echo '--------------------------------------'",
-            "speedtest-cli --simple"
-        ]
-        
-        # 5. Execute
-        # We use a unique scheduler ID so it doesn't conflict with other timers
-        self._send_commands_sequentially(terminal, commands, "core_speedtest_scheduler_id")
+            cmd = "iperf3 -s -i 1"
+            self._send_commands_sequentially(terminal, [cmd], "core_speedtest_scheduler_id")
+        else:
+            # --- STOP ---
+            if "core_iperf" in self.terminals:
+                term=self.terminals["core_iperf"]['terminal']
+                try:
+                    term.feed_child(b'\x03')
+                except:
+                    pass
+            
+            self.reset_core_iperf_button()
 
+    def reset_core_iperf_button(self):
+        self.core_iperf_running = False
+        def update_ui():
+            if self.is_closing: return
+            if self.core_iperf_button_ref and self.core_iperf_button_ref.get_realized():
+                self.core_iperf_button_ref.set_sensitive(True)
+                ctx = self.core_iperf_button_ref.get_style_context()
+                ctx.remove_class("stop-button")
+                ctx.add_class("start-button")
+                self.core_iperf_button_ref.set_label(f"{PLAY_SYMBOL} Start Speedtest")
+        GLib.idle_add(update_ui)
     # -------------------------------------------------------------------------
     # UTILS & HELPERS
     # -------------------------------------------------------------------------
@@ -1480,6 +1696,8 @@ class SrsRanGuiApp(Gtk.Window):
                 elif key == "tshark" and self.tshark_running: 
                     self.toggle_tshark_process(None)
                     self.tshark_terminal_ref = None
+                elif key == "core_iperf":
+                    self.core_iperf_running = False
 
             # C. Define Destruction Logic
             def do_destroy(*args):
@@ -1593,7 +1811,7 @@ class SrsRanGuiApp(Gtk.Window):
         
         # Webview
         webview = WebKit2.WebView()
-        webview.load_uri("http://127.0.0.1:3000/") 
+        webview.load_uri("http://127.0.0.1:3300/") 
         
         self.webview_container.pack_start(header, False, False, 0)
         self.webview_container.pack_start(webview, True, True, 0)
@@ -1721,7 +1939,8 @@ class SrsRanGuiApp(Gtk.Window):
             for folder in folders:
                 row = Gtk.ListBoxRow()
                 btn = Gtk.Button(label=f"📂 {folder}") # Add folder icon
-                btn.set_alignment(0.0, 0.5)
+                if isinstance(btn.get_child(), Gtk.Label):
+                    btn.get_child().set_xalign(0.0)
                 btn.set_relief(Gtk.ReliefStyle.NONE)
                 
                 # Click handler: Go deeper into this directory
@@ -1735,7 +1954,8 @@ class SrsRanGuiApp(Gtk.Window):
             for f in files:
                 row = Gtk.ListBoxRow()
                 btn = Gtk.Button(label=f"📄 {f}") # Add file icon
-                btn.set_alignment(0.0, 0.5)
+                if isinstance(btn.get_child(), Gtk.Label):
+                    btn.get_child().set_xalign(0.0)
                 btn.set_relief(Gtk.ReliefStyle.NONE)
                 
                 # Click handler: View file content
@@ -1804,7 +2024,8 @@ class SrsRanGuiApp(Gtk.Window):
             for f in files:
                 row = Gtk.ListBoxRow()
                 btn = Gtk.Button(label=f)
-                btn.set_alignment(0.0, 0.5)
+                if isinstance(btn.get_child(), Gtk.Label):
+                    btn.get_child().set_xalign(0.0)
                 btn.set_relief(Gtk.ReliefStyle.NONE)
                 
                 # Connect click to the Docker file opener
@@ -1884,8 +2105,8 @@ class SrsRanGuiApp(Gtk.Window):
                 row = Gtk.ListBoxRow()
                 # Create a button for the file
                 btn = Gtk.Button(label=f)
-                btn.set_alignment(0.0, 0.5) # Align text to the left
-                # Remove button border for a cleaner list look (optional)
+                if isinstance(btn.get_child(), Gtk.Label):
+                    btn.get_child().set_xalign(0.0)
                 btn.set_relief(Gtk.ReliefStyle.NONE) 
                 
                 # Connect the click event
