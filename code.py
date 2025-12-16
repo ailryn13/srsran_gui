@@ -323,11 +323,6 @@ class SrsRanGuiApp(Gtk.Window):
     def create_tshark_control_ui(self, parent_box):
         parent_box.pack_start(self.create_title("Tshark Capture"), False, False, 0)
 
-        # Open Folder Button (Below Start)
-        open_folder_btn = Gtk.Button(label="Open Capture Folder")
-        open_folder_btn.connect("clicked", self.on_open_capture_folder_clicked)
-        parent_box.pack_start(open_folder_btn, False, False, 8)
-
         # Start Button
         self.tshark_button_ref = Gtk.Button(label=f"{PLAY_SYMBOL} Start Tshark")
         self.tshark_button_ref.get_style_context().add_class("start-button")
@@ -567,21 +562,10 @@ class SrsRanGuiApp(Gtk.Window):
         else:
             # --- STOPPING SEQUENCE (Unchanged) ---
             
-            # 1. Safety Check
-            if not force and self.ue_running:
-                dialog = Gtk.MessageDialog(
-                    transient_for=self,
-                    flags=0,
-                    message_type=Gtk.MessageType.WARNING,
-                    buttons=Gtk.ButtonsType.OK,
-                    text="UE is Still Active",
-                )
-                dialog.format_secondary_text(
-                    "Please stop the User Equipment (UE) before stopping the gNB."
-                )
-                dialog.run()
-                dialog.destroy()
-                return 
+            # 1. MUTUAL STOP LOGIC: Stop UE if it's running
+            if self.ue_running and not force:
+                # We stop the UE immediately. 
+                self.toggle_ue_process(None)
             
             # 2. Stop gNB
             if self.gnb_command_scheduler_id:
@@ -655,28 +639,21 @@ class SrsRanGuiApp(Gtk.Window):
                 self.ue_command_scheduler_id = None
             if self.ue_terminal_ref:
                 self.ue_terminal_ref.feed_child(b'\x03')
+            
             self.reset_ue_button()
+
+            if self.gnb_running:
+                self.toggle_gnb_process(None, force=True)
 
     def toggle_tshark_process(self, _):
         self.content_paned.set_position(self.default_terminal_pane_position)
-        # 1. Ensure capture folder exists (We will move the file here later)
-        if not os.path.exists(self.capture_folder_path):
-            try:
-                os.makedirs(self.capture_folder_path)
-                # Ensure the folder is owned by the user
-                sudo_user = os.environ.get('SUDO_USER')
-                if sudo_user:
-                    import pwd
-                    pw = pwd.getpwnam(sudo_user)
-                    os.chown(self.capture_folder_path, pw.pw_uid, pw.pw_gid)
-            except Exception:
-                pass
-
+        
         if not self.tshark_running:
             # --- STARTUP ---
             self.tshark_button_ref.set_sensitive(False)
             
-            terminal = self.create_terminal_tab("tshark", "Tshark NGAP Capture")
+            # Create the terminal tab
+            terminal = self.create_terminal_tab("tshark", "Tshark NGAP Filter")
             terminal.connect("child-exited", self.on_process_exited, "tshark")
             self.tshark_terminal_ref = terminal
             
@@ -690,16 +667,9 @@ class SrsRanGuiApp(Gtk.Window):
                 self.tshark_running = True
                 self.tshark_button_ref.set_sensitive(True)
 
-            # --- KEY FIX 1: CAPTURE TO /tmp FIRST ---
-            # AppArmor allows tshark to write to /tmp without issues.
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"srs_ngap_{timestamp}.pcap"
-            
-            self.temp_pcap_path = f"/tmp/{filename}"
-            self.final_pcap_path = os.path.join(self.capture_folder_path, filename)
-            
-            # Run tshark pointing to the TEMP path
-            commands = [f'sudo tshark -i any -f "sctp port 38412" -w "{self.temp_pcap_path}" -P']
+            # --- RUN COMMAND ---
+            # We strictly run the display filter command requested
+            commands = ['sudo tshark -i any -Y "ngap"']
             
             self._send_commands_sequentially(
                 terminal, 
@@ -709,15 +679,8 @@ class SrsRanGuiApp(Gtk.Window):
             )
         else:
             # --- STOPPING ---
-            
-            # --- KEY FIX 2: Tell Watchdog to ignore Tshark IMMEDIATELY ---
-            # This prevents the "Watchdog: tshark stopped unexpectedly" error.
             self.tshark_running = False 
             
-            # Disable button and show status while we save
-            self.tshark_button_ref.set_sensitive(False)
-            self.tshark_button_ref.set_label("Saving...")
-
             if self.tshark_scheduler_id:
                 GLib.source_remove(self.tshark_scheduler_id)
                 self.tshark_scheduler_id = None
@@ -725,46 +688,12 @@ class SrsRanGuiApp(Gtk.Window):
             # Kill the process
             if self.tshark_terminal_ref:
                 try:
-                    self.tshark_terminal_ref.feed_child(b'\x03') 
+                    self.tshark_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
                 except:
                     pass
             
-            # Wait and Move (Bypasses AppArmor)
-            def move_capture_file():
-                try:
-                    if hasattr(self, 'temp_pcap_path') and os.path.exists(self.temp_pcap_path):
-                        # FIX: Use 'sudo mv' via subprocess instead of shutil.move
-                        # This works even if the script is running as a normal user.
-                        subprocess.run(["sudo", "mv", self.temp_pcap_path, self.final_pcap_path], check=True)
-                        
-                        # FIX: Change ownership to the real user
-                        # (Because 'sudo mv' keeps the file owned by root)
-                        real_user = os.environ.get('SUDO_USER') or os.environ.get('USER')
-                        if real_user:
-                            subprocess.run(["sudo", "chown", f"{real_user}:{real_user}", self.final_pcap_path], check=True)
-                            
-                    else:
-                        print("Warning: No capture file found in /tmp")
-                except Exception as e:
-                    print(f"Error moving capture file: {e}")
-                
-                # Restore button state
-                self.reset_tshark_button()
-                return False # Run once
-
-            # Schedule the move operation (1.5s delay allows tshark to close file)
-            GLib.timeout_add(1500, move_capture_file)
-
-    def on_open_capture_folder_clicked(self, button):
-        try:
-            os.makedirs(self.capture_folder_path, exist_ok=True)
-            sudo_user = os.environ.get('SUDO_USER')
-            command_to_run = ['/usr/bin/xdg-open', self.capture_folder_path]
-            if sudo_user:
-                command_to_run = ['sudo', '-u', sudo_user] + command_to_run
-            subprocess.Popen(command_to_run, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print(f"Error opening folder: {e}")
+            # Reset Button immediately (No file saving to wait for)
+            self.reset_tshark_button()
 
     # -------------------------------------------------------------------------
     # IP & STATUS HELPERS
@@ -958,27 +887,47 @@ class SrsRanGuiApp(Gtk.Window):
         if key not in self.terminals:
             return
 
+        # --- CASE 1: gNB Died/Stopped ---
         if key == "gnb" and self.gnb_running:
             self.reset_gnb_button()
+            
+            # Kill Grafana
             if self.grafana_terminal_ref:
                 try:
                     self.grafana_terminal_ref.feed_child(b'\x03')
                 except Exception:
                     pass
                 self.grafana_terminal_ref = None
-        elif key == "grafana":
+            
+            # Kill UE (Cascade)
             if self.ue_running:
-                self.toggle_ue_process(None) # Auto stop UE if gNB dies
+                self.toggle_ue_process(None)
+
+        # --- CASE 2: Grafana Died/Stopped ---
+        elif key == "grafana":
+            # If Grafana dies, kill gNB (which will auto-kill UE)
             if self.gnb_running:
-                self.toggle_gnb_process(None, force=True) # Auto stop gNB if gNB dies
-        elif key == "ue" and self.ue_running:
-            self.reset_ue_button()
+                self.toggle_gnb_process(None, force=True)
+
+        # --- CASE 3: UE Died/Stopped ---
+        elif key == "ue":
+            # Reset UE UI
+            if self.ue_running:
+                self.reset_ue_button()
+            
+            # Kill gNB (Mutual Kill Switch)
+            if self.gnb_running:
+                self.toggle_gnb_process(None, force=True)
+
+        # --- CASE 4: 5G Core Died ---
         elif key == "core" and self.core_running:
-            # Core died (shell exited). 
-            # Use the shared handler to ensure UE/gNB are stopped too.
             self.handle_core_stopped_unexpectedly()
+
+        # --- CASE 5: Tshark Stopped ---
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
+
+        # --- CASE 6: iPerf Tools ---
         elif key == "core_iperf":
             self.reset_core_iperf_button()
         elif key == "ue_iperf":
@@ -1022,7 +971,8 @@ class SrsRanGuiApp(Gtk.Window):
             # key: (is_running_flag, cleanup_function, pattern)
             checks = [
                 ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c",None),
-                ('ue', self.ue_running, self.reset_ue_button, "srsue",None),
+                ('grafana', self.gnb_running, self.handle_grafana_stopped_unexpectedly, "up grafana",None),
+                ('ue', self.ue_running, self.handle_ue_stopped_unexpectedly, "srsue",None),
                 ('tshark', self.tshark_running, self.reset_tshark_button, "tshark",None),
                 # Note: "docker compose" often appears as "docker-compose" or just "docker" depending on version
                 ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose",None),
@@ -1057,6 +1007,10 @@ class SrsRanGuiApp(Gtk.Window):
         # 3. Finally reset the Core button
         self.reset_core_button()
 
+    def handle_grafana_stopped_unexpectedly(self):
+        # Trigger the standard exit logic manually
+        self.on_process_exited(None, None, "grafana")
+
     def handle_gnb_stopped_unexpectedly(self):
         self.reset_gnb_button()
         if self.grafana_terminal_ref:
@@ -1069,6 +1023,14 @@ class SrsRanGuiApp(Gtk.Window):
         if self.ue_running:
             self.toggle_ue_process(None) # Auto stop UE if gNB dies
 
+    def handle_ue_stopped_unexpectedly(self):
+        # 1. Reset UE Button (UI)
+        self.reset_ue_button()
+        
+        # 2. Trigger Cascade Stop (Kill gNB and Grafana)
+        # We use force=True to bypass the "Stop UE first" check inside toggle_gnb_process
+        if self.gnb_running:
+            self.toggle_gnb_process(None, force=True)
     # -------------------------------------------------------------------------
     # SUBMENU LOGIC
     # -------------------------------------------------------------------------
@@ -1292,7 +1254,6 @@ class SrsRanGuiApp(Gtk.Window):
             ("Config", self.on_gnb_config),
             ("Logs", self.on_gnb_logs),
             ("Web UI", self.on_gnb_webui),
-            ("Pcap", self.on_gnb_pcap),
         ]
         self.add_toolbar_with_content(items, "gnb_area", "gnb_buttons")
 
@@ -1300,8 +1261,7 @@ class SrsRanGuiApp(Gtk.Window):
         # Removed "Speedtest" from this list
         items = [
             ("Config", self.on_ue_config),
-            ("Logs", self.on_ue_logs),
-            ("Pcap", self.on_ue_pcap),
+            ("Logs", self.on_ue_logs)
         ]
         
         # Capture the button container
@@ -1416,16 +1376,6 @@ class SrsRanGuiApp(Gtk.Window):
         self.content_paned.pack1(self.webview_container, resize=True, shrink=False)
         self.webview_container.show_all()
 
-    def on_ue_pcap(self, _):
-        # Placeholder for Pcap
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        box = self.ue_area
-        for c in box.get_children(): box.remove(c)
-        lbl = Gtk.Label(label="Pcap functionality coming soon")
-        box.pack_start(lbl, True, True, 0)
-        box.show_all()
-
     def toggle_ue_iperf(self, widget):
         # Ensure we switch to terminal view so user sees the result
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -1481,17 +1431,6 @@ class SrsRanGuiApp(Gtk.Window):
                 ctx.add_class("start-button")
                 self.ue_iperf_button_ref.set_label(f"{PLAY_SYMBOL} Start Speedtest")
         GLib.idle_add(update_ui)
-
-    def on_gnb_pcap(self, _):
-        # Placeholder for Pcap
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        box = self.gnb_area
-        for c in box.get_children(): box.remove(c)
-        lbl = Gtk.Label(label="Pcap functionality coming soon")
-        box.pack_start(lbl, True, True, 0)
-        box.show_all()
-
 
     def on_ue_binaries(self, _):
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -1686,13 +1625,30 @@ class SrsRanGuiApp(Gtk.Window):
                     self.toggle_core_process(None, force=True)
                     self.core_terminal_ref = None
             else:
-                # Normal stop for other tabs
-                if key == "ue" and self.ue_running: 
-                    self.toggle_ue_process(None)
+                # --- 1. Closing UE Tab ---
+                if key == "ue":
+                    if self.ue_running: 
+                        self.toggle_ue_process(None)
+                    
+                    # CASCADE: Stop gNB and Grafana
+                    if self.gnb_running:
+                        self.toggle_gnb_process(None, force=True)
                     self.ue_terminal_ref = None
+
+                # --- 2. Closing gNB Tab ---
                 elif key == "gnb" and self.gnb_running: 
+                    # This function already handles stopping UE and Grafana
                     self.toggle_gnb_process(None)
                     self.gnb_terminal_ref = None
+
+                # --- 3. Closing Grafana Tab ---
+                elif key == "grafana":
+                    # If Grafana tab is closed, kill gNB (which kills UE)
+                    if self.gnb_running:
+                        self.toggle_gnb_process(None, force=True)
+                    self.grafana_terminal_ref = None
+
+                # --- 4. Other Tabs ---
                 elif key == "tshark" and self.tshark_running: 
                     self.toggle_tshark_process(None)
                     self.tshark_terminal_ref = None
