@@ -567,21 +567,10 @@ class SrsRanGuiApp(Gtk.Window):
         else:
             # --- STOPPING SEQUENCE (Unchanged) ---
             
-            # 1. Safety Check
-            if not force and self.ue_running:
-                dialog = Gtk.MessageDialog(
-                    transient_for=self,
-                    flags=0,
-                    message_type=Gtk.MessageType.WARNING,
-                    buttons=Gtk.ButtonsType.OK,
-                    text="UE is Still Active",
-                )
-                dialog.format_secondary_text(
-                    "Please stop the User Equipment (UE) before stopping the gNB."
-                )
-                dialog.run()
-                dialog.destroy()
-                return 
+            # 1. MUTUAL STOP LOGIC: Stop UE if it's running
+            if self.ue_running and not force:
+                # We stop the UE immediately. 
+                self.toggle_ue_process(None)
             
             # 2. Stop gNB
             if self.gnb_command_scheduler_id:
@@ -655,7 +644,11 @@ class SrsRanGuiApp(Gtk.Window):
                 self.ue_command_scheduler_id = None
             if self.ue_terminal_ref:
                 self.ue_terminal_ref.feed_child(b'\x03')
+            
             self.reset_ue_button()
+
+            if self.gnb_running:
+                self.toggle_gnb_process(None, force=True)
 
     def toggle_tshark_process(self, _):
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -958,27 +951,47 @@ class SrsRanGuiApp(Gtk.Window):
         if key not in self.terminals:
             return
 
+        # --- CASE 1: gNB Died/Stopped ---
         if key == "gnb" and self.gnb_running:
             self.reset_gnb_button()
+            
+            # Kill Grafana
             if self.grafana_terminal_ref:
                 try:
                     self.grafana_terminal_ref.feed_child(b'\x03')
                 except Exception:
                     pass
                 self.grafana_terminal_ref = None
-        elif key == "grafana":
+            
+            # Kill UE (Cascade)
             if self.ue_running:
-                self.toggle_ue_process(None) # Auto stop UE if gNB dies
+                self.toggle_ue_process(None)
+
+        # --- CASE 2: Grafana Died/Stopped ---
+        elif key == "grafana":
+            # If Grafana dies, kill gNB (which will auto-kill UE)
             if self.gnb_running:
-                self.toggle_gnb_process(None, force=True) # Auto stop gNB if gNB dies
-        elif key == "ue" and self.ue_running:
-            self.reset_ue_button()
+                self.toggle_gnb_process(None, force=True)
+
+        # --- CASE 3: UE Died/Stopped ---
+        elif key == "ue":
+            # Reset UE UI
+            if self.ue_running:
+                self.reset_ue_button()
+            
+            # Kill gNB (Mutual Kill Switch)
+            if self.gnb_running:
+                self.toggle_gnb_process(None, force=True)
+
+        # --- CASE 4: 5G Core Died ---
         elif key == "core" and self.core_running:
-            # Core died (shell exited). 
-            # Use the shared handler to ensure UE/gNB are stopped too.
             self.handle_core_stopped_unexpectedly()
+
+        # --- CASE 5: Tshark Stopped ---
         elif key == "tshark" and self.tshark_running:
             self.reset_tshark_button()
+
+        # --- CASE 6: iPerf Tools ---
         elif key == "core_iperf":
             self.reset_core_iperf_button()
         elif key == "ue_iperf":
@@ -1022,7 +1035,8 @@ class SrsRanGuiApp(Gtk.Window):
             # key: (is_running_flag, cleanup_function, pattern)
             checks = [
                 ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c",None),
-                ('ue', self.ue_running, self.reset_ue_button, "srsue",None),
+                ('grafana', self.gnb_running, self.handle_grafana_stopped_unexpectedly, "up grafana",None),
+                ('ue', self.ue_running, self.handle_ue_stopped_unexpectedly, "srsue",None),
                 ('tshark', self.tshark_running, self.reset_tshark_button, "tshark",None),
                 # Note: "docker compose" often appears as "docker-compose" or just "docker" depending on version
                 ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose",None),
@@ -1057,6 +1071,10 @@ class SrsRanGuiApp(Gtk.Window):
         # 3. Finally reset the Core button
         self.reset_core_button()
 
+    def handle_grafana_stopped_unexpectedly(self):
+        # Trigger the standard exit logic manually
+        self.on_process_exited(None, None, "grafana")
+
     def handle_gnb_stopped_unexpectedly(self):
         self.reset_gnb_button()
         if self.grafana_terminal_ref:
@@ -1069,6 +1087,14 @@ class SrsRanGuiApp(Gtk.Window):
         if self.ue_running:
             self.toggle_ue_process(None) # Auto stop UE if gNB dies
 
+    def handle_ue_stopped_unexpectedly(self):
+        # 1. Reset UE Button (UI)
+        self.reset_ue_button()
+        
+        # 2. Trigger Cascade Stop (Kill gNB and Grafana)
+        # We use force=True to bypass the "Stop UE first" check inside toggle_gnb_process
+        if self.gnb_running:
+            self.toggle_gnb_process(None, force=True)
     # -------------------------------------------------------------------------
     # SUBMENU LOGIC
     # -------------------------------------------------------------------------
@@ -1292,7 +1318,6 @@ class SrsRanGuiApp(Gtk.Window):
             ("Config", self.on_gnb_config),
             ("Logs", self.on_gnb_logs),
             ("Web UI", self.on_gnb_webui),
-            ("Pcap", self.on_gnb_pcap),
         ]
         self.add_toolbar_with_content(items, "gnb_area", "gnb_buttons")
 
@@ -1300,8 +1325,7 @@ class SrsRanGuiApp(Gtk.Window):
         # Removed "Speedtest" from this list
         items = [
             ("Config", self.on_ue_config),
-            ("Logs", self.on_ue_logs),
-            ("Pcap", self.on_ue_pcap),
+            ("Logs", self.on_ue_logs)
         ]
         
         # Capture the button container
@@ -1416,16 +1440,6 @@ class SrsRanGuiApp(Gtk.Window):
         self.content_paned.pack1(self.webview_container, resize=True, shrink=False)
         self.webview_container.show_all()
 
-    def on_ue_pcap(self, _):
-        # Placeholder for Pcap
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        box = self.ue_area
-        for c in box.get_children(): box.remove(c)
-        lbl = Gtk.Label(label="Pcap functionality coming soon")
-        box.pack_start(lbl, True, True, 0)
-        box.show_all()
-
     def toggle_ue_iperf(self, widget):
         # Ensure we switch to terminal view so user sees the result
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -1481,17 +1495,6 @@ class SrsRanGuiApp(Gtk.Window):
                 ctx.add_class("start-button")
                 self.ue_iperf_button_ref.set_label(f"{PLAY_SYMBOL} Start Speedtest")
         GLib.idle_add(update_ui)
-
-    def on_gnb_pcap(self, _):
-        # Placeholder for Pcap
-        allocation = self.content_paned.get_allocation()
-        self.content_paned.set_position(allocation.height)
-        box = self.gnb_area
-        for c in box.get_children(): box.remove(c)
-        lbl = Gtk.Label(label="Pcap functionality coming soon")
-        box.pack_start(lbl, True, True, 0)
-        box.show_all()
-
 
     def on_ue_binaries(self, _):
         self.content_paned.set_position(self.default_terminal_pane_position)
@@ -1686,13 +1689,30 @@ class SrsRanGuiApp(Gtk.Window):
                     self.toggle_core_process(None, force=True)
                     self.core_terminal_ref = None
             else:
-                # Normal stop for other tabs
-                if key == "ue" and self.ue_running: 
-                    self.toggle_ue_process(None)
+                # --- 1. Closing UE Tab ---
+                if key == "ue":
+                    if self.ue_running: 
+                        self.toggle_ue_process(None)
+                    
+                    # CASCADE: Stop gNB and Grafana
+                    if self.gnb_running:
+                        self.toggle_gnb_process(None, force=True)
                     self.ue_terminal_ref = None
+
+                # --- 2. Closing gNB Tab ---
                 elif key == "gnb" and self.gnb_running: 
+                    # This function already handles stopping UE and Grafana
                     self.toggle_gnb_process(None)
                     self.gnb_terminal_ref = None
+
+                # --- 3. Closing Grafana Tab ---
+                elif key == "grafana":
+                    # If Grafana tab is closed, kill gNB (which kills UE)
+                    if self.gnb_running:
+                        self.toggle_gnb_process(None, force=True)
+                    self.grafana_terminal_ref = None
+
+                # --- 4. Other Tabs ---
                 elif key == "tshark" and self.tshark_running: 
                     self.toggle_tshark_process(None)
                     self.tshark_terminal_ref = None
