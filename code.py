@@ -43,6 +43,7 @@ class SrsRanGuiApp(Gtk.Window):
 
         self.grafana_terminal_ref = None
         self.grafana_scheduler_id = None
+        self.grafana_start_time = 0
         
         self.ue_running = False
         self.ue_terminal_ref = None
@@ -473,13 +474,13 @@ class SrsRanGuiApp(Gtk.Window):
     # PROCESS LOGIC
     # -------------------------------------------------------------------------
 
-    def _show_alert(self, message):
+    def _show_alert(self, message, title="Startup Order Error"):
         dialog = Gtk.MessageDialog(
             transient_for=self,
             flags=0,
             message_type=Gtk.MessageType.WARNING,
             buttons=Gtk.ButtonsType.OK,
-            text="Startup Order Error",
+            text=title,
         )
         dialog.format_secondary_text(message)
         dialog.run()
@@ -487,84 +488,66 @@ class SrsRanGuiApp(Gtk.Window):
 
     def toggle_gnb_process(self, widget, force=False):
         if not self.gnb_running:
-            # --- STARTUP SEQUENCE ---
-            
-            # 1. Prerequisite Check
+            # --- STARTUP SEQUENCE (Unchanged) ---
             if not self.core_running:
                 self._show_alert("Please start the 5G Core Network first.")
                 return
 
             self.gnb_button_ref.set_sensitive(False)
-
-            # 2. Start Grafana (Foreground Mode)
-            grafana_terminal = self.create_terminal_tab("grafana", "Grafana Service")
-            self.grafana_terminal_ref = grafana_terminal
+            gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
+            self.gnb_terminal_ref = gnb_terminal
             
-            # Use absolute path for safety
-            grafana_cmd = [
+            ctx = self.gnb_button_ref.get_style_context()
+            ctx.remove_class("start-button")
+            ctx.add_class("stop-button")
+            self.gnb_button_ref.set_label(f"{STOP_SYMBOL} Stop gNB")
+
+            def gnb_startup_complete():
+                self.gnb_running = True
+                self.gnb_button_ref.set_sensitive(True)
+                self.fetch_and_display_gnb_ips()
+
+            commands = [
                 "sudo su",
                 "cd",
-                "cd srsRAN_Project/", 
-                "sudo docker compose -f docker/docker-compose.yml up grafana" 
+                "cd srsRAN_Project/build/apps/gnb", 
+                "sudo gnb -c /home/student/Downloads/gnb_zmq.yaml" 
             ]
-            self._send_commands_sequentially(grafana_terminal, grafana_cmd, "grafana_scheduler_id")
             
-            # 3. Resize Terminal (Optional, if you added this helper previously)
-            if hasattr(self, 'maximize_terminal_view'):
-                self.maximize_terminal_view()
+            self._send_commands_sequentially(
+                gnb_terminal,
+                commands,
+                "gnb_command_scheduler_id",
+                delay=1000,
+                on_complete=gnb_startup_complete
+            )
 
-            # --- KEY FIX: NON-BLOCKING DELAY ---
-            # Instead of time.sleep(2), we define the gNB startup as a separate function
-            # and schedule it to run in 2000ms (2 seconds).
-            
-            def start_gnb_delayed():
-                if self.is_closing: return False
+            # Schedule Grafana Start
+            def start_grafana_delayed():
+                if self.is_closing or not self.gnb_running: 
+                    return False
 
-                # 4. Start gNB (Foreground Tab)
-                gnb_terminal = self.create_terminal_tab("gnb", "gNB Console")
-                self.gnb_terminal_ref = gnb_terminal
+                grafana_terminal = self.create_terminal_tab("grafana", "Grafana Service")
+                self.grafana_terminal_ref = grafana_terminal
+                self.grafana_start_time = time.time() # Ensure this variable exists in __init__
                 
-                # Update Button Style
-                ctx = self.gnb_button_ref.get_style_context()
-                ctx.remove_class("start-button")
-                ctx.add_class("stop-button")
-                self.gnb_button_ref.set_label(f"{STOP_SYMBOL} Stop gNB")
-
-                def startup_complete():
-                    self.gnb_running = True
-                    self.gnb_button_ref.set_sensitive(True)
-                    self.fetch_and_display_gnb_ips()
-
-                commands = [
+                grafana_cmd = [
                     "sudo su",
                     "cd",
-                    "cd srsRAN_Project/build/apps/gnb", # Absolute path
-                    "sudo gnb -c /home/student/Downloads/gnb_zmq.yaml" # Absolute path
+                    "cd srsRAN_Project/", 
+                    "sudo docker compose -f docker/docker-compose.yml up grafana" 
                 ]
-                
-                self._send_commands_sequentially(
-                    gnb_terminal,
-                    commands,
-                    "gnb_command_scheduler_id",
-                    delay=1000,
-                    on_complete=startup_complete
-                )
-                
-                # If you want the view to switch to the new gNB tab:
-                if hasattr(self, 'maximize_terminal_view'):
-                    self.maximize_terminal_view()
-                    
-                return False # Run once
+                self._send_commands_sequentially(grafana_terminal, grafana_cmd, "grafana_scheduler_id")
+                return False 
 
-            # Schedule the gNB start for 2 seconds later (allows Grafana to init)
-            GLib.timeout_add(2000, start_gnb_delayed)
+            GLib.timeout_add(7000, start_grafana_delayed)
             
         else:
-            # --- STOPPING SEQUENCE (Unchanged) ---
+            # --- STOPPING SEQUENCE (Fixed) ---
             
-            # 1. MUTUAL STOP LOGIC: Stop UE if it's running
-            if self.ue_running and not force:
-                # We stop the UE immediately. 
+            # 1. ALWAYS stop UE if it is running.
+            # We removed 'and not force' so this always executes.
+            if self.ue_running:
                 self.toggle_ue_process(None)
             
             # 2. Stop gNB
@@ -572,9 +555,12 @@ class SrsRanGuiApp(Gtk.Window):
                 GLib.source_remove(self.gnb_command_scheduler_id)
                 self.gnb_command_scheduler_id = None
             if self.gnb_terminal_ref:
-                self.gnb_terminal_ref.feed_child(b'\x03') 
+                try:
+                    self.gnb_terminal_ref.feed_child(b'\x03') # Send Ctrl+C
+                except:
+                    pass
             
-            # 3. Stop Grafana
+            # 3. Stop Grafana (Cascading Stop)
             if self.grafana_terminal_ref:
                 try:
                     self.grafana_terminal_ref.feed_child(b'\x03') 
@@ -889,6 +875,10 @@ class SrsRanGuiApp(Gtk.Window):
 
         # --- CASE 1: gNB Died/Stopped ---
         if key == "gnb" and self.gnb_running:
+            # If gNB dies, we must kill UE
+            if self.ue_running:
+                self.toggle_ue_process(None)
+            
             self.reset_gnb_button()
             
             # Kill Grafana
@@ -898,24 +888,19 @@ class SrsRanGuiApp(Gtk.Window):
                 except Exception:
                     pass
                 self.grafana_terminal_ref = None
-            
-            # Kill UE (Cascade)
-            if self.ue_running:
-                self.toggle_ue_process(None)
 
         # --- CASE 2: Grafana Died/Stopped ---
         elif key == "grafana":
-            # If Grafana dies, kill gNB (which will auto-kill UE)
+            # If Grafana dies, kill gNB (which will now Auto-kill UE thanks to the fix in toggle_gnb)
             if self.gnb_running:
                 self.toggle_gnb_process(None, force=True)
 
         # --- CASE 3: UE Died/Stopped ---
         elif key == "ue":
             # Reset UE UI
-            if self.ue_running:
-                self.reset_ue_button()
+            self.reset_ue_button()
             
-            # Kill gNB (Mutual Kill Switch)
+            # If UE dies, we usually kill gNB too (Mutual Kill Switch)
             if self.gnb_running:
                 self.toggle_gnb_process(None, force=True)
 
@@ -935,62 +920,53 @@ class SrsRanGuiApp(Gtk.Window):
 
     def _check_process_running_native(self, pattern):
         """
-        Optimization: Checks if a process is running by reading /proc directly.
-        This avoids the overhead of spawning a 'pgrep' subprocess 4 times per loop.
+        Checks if a process is running using pgrep.
+        This is more robust than reading /proc directly, especially for sudo processes.
         """
         try:
-            # Iterate over all PIDs in /proc
-            for pid in os.listdir('/proc'):
-                if pid.isdigit():
-                    try:
-                        # Read the command line arguments for the process
-                        with open(f'/proc/{pid}/cmdline', 'rb') as f:
-                            # Arguments are separated by null bytes (\x00)
-                            content = f.read()
-                            if not content: continue
-                            
-                            # Decode and format as a single string
-                            cmd_str = content.replace(b'\x00', b' ').decode('utf-8', errors='ignore')
-                            
-                            if pattern in cmd_str:
-                                return True
-                    except (FileNotFoundError, PermissionError, OSError):
-                        # Process might have died while we were checking, just skip
-                        continue
-        except Exception:
-            pass
-        return False
+            # -f matches against the full command line
+            subprocess.check_call(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except subprocess.CalledProcessError:
+            return False
     
     def _watchdog_loop(self):
         while self.watchdog_running:
-            time.sleep(2) # Keep the 2-second interval
+            time.sleep(2) 
             
             if self.is_closing:
                 break
 
-            # key: (is_running_flag, cleanup_function, pattern)
             checks = [
-                ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c",None),
-                ('grafana', self.gnb_running, self.handle_grafana_stopped_unexpectedly, "up grafana",None),
-                ('ue', self.ue_running, self.handle_ue_stopped_unexpectedly, "srsue",None),
-                ('tshark', self.tshark_running, self.reset_tshark_button, "tshark",None),
-                # Note: "docker compose" often appears as "docker-compose" or just "docker" depending on version
-                ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose",None),
-                ('core_iperf', self.core_iperf_running, self.reset_core_iperf_button, "iperf3 -s",'core_iperf_start_time'),
-                ('ue_iperf', self.ue_iperf_running, self.reset_ue_iperf_button, "iperf3 -c",'ue_iperf_start_time')
+                # key, condition, cleanup_func, process_pattern, grace_timer_attr
+                ('gnb', self.gnb_running, self.handle_gnb_stopped_unexpectedly, "gnb -c", None),
+                
+                # --- MODIFIED GRAFANA LINE ---
+                # 1. Check (gnb AND grafana_ref) so we don't check during the 7s delay
+                # 2. Add 'grafana_start_time' so we don't kill it while Docker is booting
+                ('grafana', (self.gnb_running and self.grafana_terminal_ref), self.handle_grafana_stopped_unexpectedly, "up grafana", "grafana_start_time"),
+                # -----------------------------
+
+                ('ue', self.ue_running, self.handle_ue_stopped_unexpectedly, "srsue", None),
+                ('tshark', self.tshark_running, self.reset_tshark_button, "tshark", None),
+                ('core', self.core_running, self.handle_core_stopped_unexpectedly, "docker compose", None),
+                ('core_iperf', self.core_iperf_running, self.reset_core_iperf_button, "iperf3 -s", 'core_iperf_start_time'),
+                ('ue_iperf', self.ue_iperf_running, self.reset_ue_iperf_button, "iperf3 -c", 'ue_iperf_start_time')
             ]
+            
             try:
                 for key, running, func, ptrn, grace_attr in checks:
                     if running:
                         if grace_attr:
                             start_ts = getattr(self, grace_attr, 0)
+                            # Allow 15 seconds grace period for startup
                             if time.time() - start_ts < 15:
                                 continue
-                        # USE THE NEW OPTIMIZED CHECK
+                        
                         if not self._check_process_running_native(ptrn):
                             GLib.idle_add(func)
             except Exception as e:
-                print(f"Watchdog Error: {e}")       
+                print(f"Watchdog Error: {e}")     
 
     def handle_core_stopped_unexpectedly(self):
         # This function is called by the Watchdog when it sees 
@@ -1253,6 +1229,7 @@ class SrsRanGuiApp(Gtk.Window):
         items = [
             ("Config", self.on_gnb_config),
             ("Logs", self.on_gnb_logs),
+            ("Pcaps", self.on_gnb_pcap),	
             ("Web UI", self.on_gnb_webui),
         ]
         self.add_toolbar_with_content(items, "gnb_area", "gnb_buttons")
@@ -1261,7 +1238,8 @@ class SrsRanGuiApp(Gtk.Window):
         # Removed "Speedtest" from this list
         items = [
             ("Config", self.on_ue_config),
-            ("Logs", self.on_ue_logs)
+            ("Logs", self.on_ue_logs),
+            ("Pcaps", self.on_ue_pcap),
         ]
         
         # Capture the button container
@@ -1283,6 +1261,47 @@ class SrsRanGuiApp(Gtk.Window):
         # Pack it at the end of the toolbar
         hbox.pack_start(self.ue_iperf_button_ref, False, False, 0)
         hbox.show_all()
+
+    def on_gnb_pcap(self, _):
+        """Displays a list of gNB PCAP files found in the system."""
+        
+        # --- NEW: Check if gNB is running ---
+        if self.gnb_running:
+            self._show_alert(
+                message="Please stop the gNB process before accessing PCAP files.", 
+                title="Action Blocked"
+            )
+            return
+        # ------------------------------------
+
+        # We look for .pcap files in /tmp (common srsRAN output)
+        self._display_file_list_menu(
+            area_box=self.gnb_area, 
+            directory="/tmp", 
+            extension=".pcap", 
+            key_prefix="gnb_pcap",
+            filter_str="gnb"
+        )
+
+    def on_ue_pcap(self, _):
+        """Displays a list of UE PCAP files found in the system."""
+        
+        # --- NEW: Check if UE is running ---
+        if self.ue_running:
+            self._show_alert(
+                message="Please stop the UE process before accessing PCAP files.", 
+                title="Action Blocked"
+            )
+            return
+        # -----------------------------------
+
+        self._display_file_list_menu(
+            area_box=self.ue_area, 
+            directory="/tmp", 
+            extension=".pcap", 
+            key_prefix="ue_pcap",
+            filter_str="ue"
+        )
 
     def on_gnb_logs(self, _):
         # 1. Switch to terminal view
@@ -1605,74 +1624,45 @@ class SrsRanGuiApp(Gtk.Window):
         terminal.set_scrollback_lines(1000)
         terminal.spawn_async(Vte.PtyFlags.DEFAULT, os.environ['HOME'], ["/bin/bash"], [], GLib.SpawnFlags.DEFAULT, None, None, -1, None, None)
         
-        # --- RESTORED LISTENER: This makes Ctrl+C work ---
         terminal.connect("child-exited", self.on_process_exited, key)
-        # -------------------------------------------------
 
-        # 3. Graceful Close Logic (The previous fix)
+        # 3. FIXED CLOSE LOGIC
         def close_tab(_):
-            # A. Unregister from dictionary immediately
-            self.terminals.pop(key, None)
+            # A. Kill the process inside the terminal immediately
+            try:
+                terminal.feed_child(b'\x03') # Send Ctrl+C
+            except:
+                pass
 
-            # B. CASCADE SHUTDOWN
-            # If "Core" tab is closed manually, kill dependencies
-            if key == "core":
-                if self.ue_running:
-                    self.toggle_ue_process(None)
+            # B. Trigger the specific stop logic for this component
+            # This ensures the cascade (e.g., closing gNB tab stops UE) happens
+            if key == "gnb" and self.gnb_running:
+                self.toggle_gnb_process(None, force=True)
+            elif key == "ue" and self.ue_running:
+                self.toggle_ue_process(None)
+            elif key == "grafana":
+                # Closing Grafana tab should stop gNB (and thus UE)
                 if self.gnb_running:
-                    self.toggle_gnb_process(None, force=True) # Force used here
-                if self.core_running:
-                    self.toggle_core_process(None, force=True)
-                    self.core_terminal_ref = None
-            else:
-                # --- 1. Closing UE Tab ---
-                if key == "ue":
-                    if self.ue_running: 
-                        self.toggle_ue_process(None)
-                    
-                    # CASCADE: Stop gNB and Grafana
-                    if self.gnb_running:
-                        self.toggle_gnb_process(None, force=True)
-                    self.ue_terminal_ref = None
-
-                # --- 2. Closing gNB Tab ---
-                elif key == "gnb" and self.gnb_running: 
-                    # This function already handles stopping UE and Grafana
-                    self.toggle_gnb_process(None)
-                    self.gnb_terminal_ref = None
-
-                # --- 3. Closing Grafana Tab ---
-                elif key == "grafana":
-                    # If Grafana tab is closed, kill gNB (which kills UE)
-                    if self.gnb_running:
-                        self.toggle_gnb_process(None, force=True)
-                    self.grafana_terminal_ref = None
-
-                # --- 4. Other Tabs ---
-                elif key == "tshark" and self.tshark_running: 
-                    self.toggle_tshark_process(None)
-                    self.tshark_terminal_ref = None
-                elif key == "core_iperf":
-                    self.core_iperf_running = False
-
-            # C. Define Destruction Logic
-            def do_destroy(*args):
+                    self.toggle_gnb_process(None, force=True)
+                self.grafana_terminal_ref = None
+            elif key == "core" and self.core_running:
+                self.toggle_core_process(None, force=True)
+            elif key == "tshark" and self.tshark_running:
+                self.toggle_tshark_process(None)
+            
+            # C. Clean up the UI
+            self.terminals.pop(key, None)
+            
+            # D. Destroy the visual element after a brief delay to allow clean exit
+            def do_destroy():
                 if self.terminal_notebook:
                     page = self.terminal_notebook.page_num(frame)
                     if page != -1: 
                         self.terminal_notebook.remove_page(page)
-                GLib.idle_add(frame.destroy)
+                frame.destroy()
                 return False
-
-            # D. Wait for process death before hiding UI
-            if terminal.get_pty() is not None:
-                btn_close.set_sensitive(False)
-                lbl.set_text(f"{title} (Stopping...)")
-                # We use a local handler for the CLOSE BUTTON destroy logic
-                terminal.connect("child-exited", do_destroy)
-                GLib.timeout_add_seconds(2, do_destroy)
-            else:
-                do_destroy()
+                
+            GLib.timeout_add(100, do_destroy)
 
         btn_close.connect("clicked", close_tab)
         vbox.pack_start(header, False, False, 0)
@@ -1693,9 +1683,7 @@ class SrsRanGuiApp(Gtk.Window):
         new_page_num = self.terminal_notebook.page_num(frame)
         GLib.idle_add(self.terminal_notebook.set_current_page, new_page_num)
         
-        # Store valid reference
         self.terminals[key] = {'frame': frame, 'terminal': terminal}
-        
         self.terminal_notebook.show_all()
         return terminal
 
@@ -2028,22 +2016,34 @@ class SrsRanGuiApp(Gtk.Window):
         command = f"sudo docker exec {container_name} cat {full_path}\n"
         
         GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
-    def _display_file_list_menu(self, area_box, directory, extension, key_prefix):
+    
+    def _display_file_list_menu(self, area_box, directory, extension, key_prefix, filter_str=None):
         """
         Generic function to list files in a directory as buttons.
+        Now supports filtering by filename string (e.g., only show files containing 'gnb').
         """
         # 1. Clear the content area (gnb_area, ue_area, etc.)
         for child in area_box.get_children():
             area_box.remove(child)
             
-        # 2. Expand the user path (e.g., turn '~' into '/home/student')
+        # 2. Expand the user path
         full_dir_path = os.path.expanduser(directory)
         
-        # 3. List files
+        # 3. List files with logic
+        files = []
         if os.path.exists(full_dir_path):
-            files = sorted([f for f in os.listdir(full_dir_path) if f.endswith(extension)])
-        else:
-            files = []
+            all_files = os.listdir(full_dir_path)
+            for f in all_files:
+                # Must match extension (e.g., .pcap)
+                if not f.endswith(extension):
+                    continue
+                
+                # Must match filter string if provided (e.g., "gnb")
+                if filter_str and filter_str not in f:
+                    continue
+                    
+                files.append(f)
+            files.sort()
             
         # 4. Create the ListBox for buttons
         listbox = Gtk.ListBox()
@@ -2051,7 +2051,10 @@ class SrsRanGuiApp(Gtk.Window):
 
         if not files:
             row = Gtk.ListBoxRow()
-            lbl = Gtk.Label(label=f"No {extension} files found in {full_dir_path}")
+            msg = f"No files found"
+            if filter_str:
+                msg += f" matching '{filter_str}'"
+            lbl = Gtk.Label(label=msg)
             lbl.set_margin_top(10)
             lbl.set_margin_bottom(10)
             row.add(lbl)
@@ -2059,13 +2062,11 @@ class SrsRanGuiApp(Gtk.Window):
         else:
             for f in files:
                 row = Gtk.ListBoxRow()
-                # Create a button for the file
                 btn = Gtk.Button(label=f)
                 if isinstance(btn.get_child(), Gtk.Label):
                     btn.get_child().set_xalign(0.0)
                 btn.set_relief(Gtk.ReliefStyle.NONE) 
                 
-                # Connect the click event
                 full_file_path = os.path.join(full_dir_path, f)
                 btn.connect("clicked", self.on_generic_file_clicked, full_file_path, key_prefix)
                 
@@ -2077,7 +2078,7 @@ class SrsRanGuiApp(Gtk.Window):
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.add(listbox)
         
-        # 6. Add title and list to the area
+        # 6. Add title
         lbl_dir = Gtk.Label(label=f"Directory: {full_dir_path}")
         lbl_dir.get_style_context().add_class("header-title")
         lbl_dir.set_margin_bottom(10)
@@ -2086,27 +2087,53 @@ class SrsRanGuiApp(Gtk.Window):
         area_box.pack_start(scrolled, True, True, 0)
         area_box.show_all()
         
-        # Ensure the view panel is set to show this content (hiding terminal temporarily)
         allocation = self.content_paned.get_allocation()
         self.content_paned.set_position(allocation.height)
 
     def on_generic_file_clicked(self, button, full_file_path, key_prefix):
         """
-        Opens a terminal tab and 'cats' the file when a button is clicked.
+        Opens Wireshark for .pcap files, or a terminal viewer for others.
         """
-        # 1. Switch view to terminal pane
+        filename = os.path.basename(full_file_path)
+
+        # --- CASE 1: PCAP FILE (Open Wireshark) ---
+        if filename.lower().endswith(".pcap"):
+            try:
+                print(f"Opening {filename} in Wireshark...")
+                
+                # 1. Determine the correct user to run Wireshark as
+                # If script is run via sudo, SUDO_USER holds the original username.
+                real_user = os.environ.get('SUDO_USER')
+                
+                # 2. Fix Permissions: Ensure the regular user can read the file
+                # (Files created by gNB/UE are often owned by root and unreadable by others)
+                subprocess.run(["sudo", "chmod", "a+r", full_file_path], check=False)
+
+                # 3. Construct the Command
+                if real_user:
+                    # If we are root, downgrade to the regular user
+                    cmd = ["sudo", "-u", real_user, "wireshark", "-r", full_file_path]
+                else:
+                    # If we are already a regular user, just run wireshark directly
+                    # (Do NOT use 'sudo' here, as that causes the malformed packet issue)
+                    cmd = ["wireshark", "-r", full_file_path]
+
+                subprocess.Popen(cmd)
+                
+            except Exception as e:
+                print(f"Error launching Wireshark: {e}")
+            return
+
+        # --- CASE 2: NORMAL TEXT FILE (Open Terminal Tab) ---
         self.content_paned.set_position(self.default_terminal_pane_position)
         
-        # 2. Extract filename for the tab title
-        filename = os.path.basename(full_file_path)
-        
-        # 3. Create the tab
+        # Create the tab
         terminal = self.create_terminal_tab(f"{key_prefix}_conf_{filename}", f"Conf: {filename}")
         
-        # 4. Command to display the file
+        # Command to display the file
         command = f"cat {full_file_path}\n"
         
-        # 5. Execute
+        # Execute
         GLib.timeout_add(300, lambda: (terminal.feed_child(command.encode()) or False) if not self.is_closing else False)
         
     def on_delete_event(self, widget, event):
