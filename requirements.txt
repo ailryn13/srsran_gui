@@ -1,0 +1,10 @@
+# srsRAN GUI Dependencies
+
+# Core dependencies
+# Tkinter comes with Python standard library - no additional packages required
+
+# Optional: For future enhancements, consider:
+# - psutil: For advanced process monitoring
+# - matplotlib: For real-time graphs and charts
+# - pyyaml: For YAML config file support
+
